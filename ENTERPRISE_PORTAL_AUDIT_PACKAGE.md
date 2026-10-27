@@ -150,8 +150,8 @@ android {
         applicationId = "com.corp.enclaveshield"
         minSdk = 33
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -178,9 +178,16 @@ tasks.register("copyApkToRoot") {
         val debugApkDir = File(buildDir, "outputs/apk/debug")
         val apkFile = debugApkDir.listFiles()?.firstOrNull { it.extension == "apk" && !it.name.contains("unaligned") }
         if (apkFile != null) {
-            val ver = "1.0"
+            val ver = android.defaultConfig.versionName ?: "1.1"
             val targetName = "EnclaveShield-$ver.apk"
             val destInRoot = File(rootDir, targetName)
+
+            // Clean up old EnclaveShield-*.apk files in rootDir so the user sees the fresh version
+            rootDir.listFiles()?.filter { it.name.startsWith("EnclaveShield-") && it.name.endsWith(".apk") && it.name != targetName }?.forEach { oldApk ->
+                println("🗑️ Removing outdated APK from root: ${oldApk.name}")
+                oldApk.delete()
+            }
+
             apkFile.copyTo(destInRoot, overwrite = true)
             val destInOutput = File(debugApkDir, targetName)
             if (apkFile.name != targetName) {
@@ -1909,7 +1916,7 @@ class MainActivity : AppCompatActivity() {
         return ComponentVersions(
             appVersionName = verName,
             appVersionCode = verCode,
-            stageHardening = "Stage 9: Final Production Hardening",
+            stageHardening = "Stage 10: Zero-Trust Hardening & Code Review Remediation",
             androidRelease = Build.VERSION.RELEASE,
             apiLevel = Build.VERSION.SDK_INT,
             securityPatch = patch,
@@ -4756,7 +4763,7 @@ class SecurityAuditLogger(context: Context) {
         sb.appendLine()
 
         sb.appendLine("## 1. Device & OS Environment")
-        sb.appendLine("- **App & Hardening:** `EnclaveShield v1.0 (Build 1) • Stage 9: Final Production Hardening`")
+        sb.appendLine("- **App & Hardening:** `EnclaveShield v1.1 (Build 2) • Stage 10: Zero-Trust Hardening & Code Review Remediation`")
         sb.appendLine("- **Device:** `${Build.MANUFACTURER} ${Build.MODEL} (${Build.DEVICE})`")
         sb.appendLine("- **Android Version:** `Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})`")
         sb.appendLine("- **Target SDK:** `API 36`, **Min SDK:** `API 33`")

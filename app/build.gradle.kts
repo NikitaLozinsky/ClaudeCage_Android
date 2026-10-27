@@ -14,8 +14,8 @@ android {
         applicationId = "com.example.claudecageand"
         minSdk = 33
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -42,9 +42,16 @@ tasks.register("copyApkToRoot") {
         val debugApkDir = File(buildDir, "outputs/apk/debug")
         val apkFile = debugApkDir.listFiles()?.firstOrNull { it.extension == "apk" && !it.name.contains("unaligned") }
         if (apkFile != null) {
-            val ver = "1.0"
+            val ver = android.defaultConfig.versionName ?: "1.1"
             val targetName = "ClaudeCage-$ver.apk"
             val destInRoot = File(rootDir, targetName)
+
+            // Clean up old ClaudeCage-*.apk files in rootDir so the user sees the fresh version
+            rootDir.listFiles()?.filter { it.name.startsWith("ClaudeCage-") && it.name.endsWith(".apk") && it.name != targetName }?.forEach { oldApk ->
+                println("🗑️ Removing outdated APK from root: ${oldApk.name}")
+                oldApk.delete()
+            }
+
             apkFile.copyTo(destInRoot, overwrite = true)
             val destInOutput = File(debugApkDir, targetName)
             if (apkFile.name != targetName) {
