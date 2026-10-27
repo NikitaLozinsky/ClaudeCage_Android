@@ -75,6 +75,8 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
             android:name=".EnclaveShieldApp"
@@ -414,6 +416,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -427,6 +430,7 @@ import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import com.corp.enclaveshield.accounts.AccountProfile
 import com.corp.enclaveshield.net.VpnTunnelState
+import com.corp.enclaveshield.notifications.EnclaveNotificationBridge
 import com.corp.enclaveshield.security.AntiFingerprintHardener
 import com.corp.enclaveshield.ui.AppIconOption
 import com.corp.enclaveshield.ui.UiLanguage
@@ -438,6 +442,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Main application activity hosting an isolated WebView strictly bound to the in-process
@@ -543,6 +548,27 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val pendingNotificationPermissionRequests = ConcurrentHashMap<String, (String) -> Unit>()
+    private var notificationBridge: EnclaveNotificationBridge? = null
+
+    private val requestNotificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted: Boolean ->
+        val status = if (isGranted) "granted" else "denied"
+        if (isGranted) {
+            Log.i(TAG, "POST_NOTIFICATIONS permission granted")
+            app.auditLogger.logInfo("Notification", "POST_NOTIFICATIONS granted by user")
+        } else {
+            Log.w(TAG, "POST_NOTIFICATIONS permission denied")
+            app.auditLogger.logWarning("Notification", "POST_NOTIFICATIONS denied by user")
+        }
+        val reqIds = ArrayList(pendingNotificationPermissionRequests.keys)
+        reqIds.forEach { reqId ->
+            pendingNotificationPermissionRequests.remove(reqId)?.invoke(status)
+            notificationBridge?.resolveJsPermission(reqId, status)
+        }
+    }
+
     private class SafeDownloadBridge(
         private val getActiveUrl: () -> String?,
         private val onDownloaded: (ByteArray, String, String) -> Unit,
@@ -626,6 +652,14 @@ class MainActivity : AppCompatActivity() {
 
         // Configure strict ProxyController before instantiating WebView
         applyProxyOverrideAndInitialize(proxyPort)
+
+        // Request notification runtime permission on Android 13+ (API 33+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                requestNotificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+        handleNotificationIntent(intent)
 
         // Observe dead tunnel unresponsive warning (Amber state)
         lifecycleScope.launch {
@@ -867,6 +901,20 @@ class MainActivity : AppCompatActivity() {
         EnclaveShieldApp.enforceUsLocaleAndTimezone(this)
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleNotificationIntent(intent)
+    }
+
+    private fun handleNotificationIntent(intent: Intent?) {
+        val notifId = intent?.getStringExtra(EnclaveNotificationBridge.EXTRA_NOTIFICATION_ID)
+        if (!notifId.isNullOrBlank()) {
+            val safeId = notifId.replace("\\", "\\\\").replace("'", "\\'")
+            webView?.evaluateJavascript("window.__dispatchNotificationClick?.('$safeId');", null)
+        }
+    }
+
     private fun applyProxyOverrideAndInitialize(proxyPort: Int) {
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
             val err = "FATAL SECURITY ERROR: WebViewFeature.PROXY_OVERRIDE is not supported on this device!"
@@ -1056,6 +1104,29 @@ class MainActivity : AppCompatActivity() {
             ),
             "EnclaveDownload"
         )
+
+        // Wire W3C Web Notification Bridge
+        val notifBridge = EnclaveNotificationBridge(
+            activity = this,
+            getActiveUrl = { wv.url },
+            webViewProvider = { webView },
+            onRequestPermission = { reqId ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    pendingNotificationPermissionRequests[reqId] = { status ->
+                        notificationBridge?.resolveJsPermission(reqId, status)
+                    }
+                    requestNotificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                } else {
+                    val enabled = NotificationManagerCompat.from(this).areNotificationsEnabled()
+                    notificationBridge?.resolveJsPermission(reqId, if (enabled) "granted" else "denied")
+                }
+            },
+            auditLogger = app.auditLogger,
+            appIconManager = app.appIconManager
+        )
+        notificationBridge = notifBridge
+        notifBridge.ensureNotificationChannel(this)
+        wv.addJavascriptInterface(notifBridge, "EnclaveNotificationBridge")
 
         wv.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
             val filename = URLUtil.guessFileName(url, contentDisposition, mimeType ?: "text/plain")
@@ -3731,7 +3802,7 @@ class VpnStateMonitor(
 ---
 
 ### 2.8. `app/src/main/java/com/corp/enclaveshield/security/AntiFingerprintHardener.kt`
-**Role:** Document-Start JS injection: WebRTC kill, offscreen Canvas farbling, toString cloaking, TTS/Intl lock
+**Role:** Document-Start JS injection: WebRTC kill, offscreen Canvas farbling, toString cloaking, TTS/Intl lock, W3C Web Notification polyfill
 
 ```kotlin
 package com.corp.enclaveshield.security
@@ -4098,6 +4169,194 @@ object AntiFingerprintHardener {
                     }
                 }
             } catch (e) {}
+
+            // 11. W3C Web Notification API Polyfill & Native Bridge
+            try {
+                let activeNotificationId = 0;
+                window.__activeNotifications = window.__activeNotifications || {};
+
+                function Notification(title, options) {
+                    if (!(this instanceof Notification)) {
+                        throw new TypeError("Failed to construct 'Notification': Please use the 'new' operator.");
+                    }
+                    if (arguments.length === 0) {
+                        throw new TypeError("Failed to construct 'Notification': 1 argument required, but only 0 present.");
+                    }
+
+                    const self = this;
+                    const notifId = ++activeNotificationId;
+                    const opts = options || {};
+
+                    this.title = String(title);
+                    this.body = opts.body ? String(opts.body) : '';
+                    this.tag = opts.tag ? String(opts.tag) : ('notif_' + notifId);
+                    this.icon = opts.icon ? String(opts.icon) : '';
+                    this.data = opts.data !== undefined ? opts.data : null;
+                    this.silent = Boolean(opts.silent);
+                    this.timestamp = Date.now();
+
+                    this.onclick = null;
+                    this.onshow = null;
+                    this.onerror = null;
+                    this.onclose = null;
+
+                    this._listeners = {};
+                    this.addEventListener = cloak(function(type, listener) {
+                        if (typeof listener !== 'function') return;
+                        self._listeners[type] = self._listeners[type] || [];
+                        self._listeners[type].push(listener);
+                    }, 'addEventListener');
+
+                    this.removeEventListener = cloak(function(type, listener) {
+                        if (!self._listeners[type]) return;
+                        self._listeners[type] = self._listeners[type].filter(l => l !== listener);
+                    }, 'removeEventListener');
+
+                    this.dispatchEvent = cloak(function(event) {
+                        const type = event && event.type;
+                        if (!type) return false;
+                        const handler = self['on' + type];
+                        if (typeof handler === 'function') {
+                            try { handler.call(self, event); } catch (e) {}
+                        }
+                        const list = self._listeners[type];
+                        if (list) {
+                            list.forEach(l => {
+                                try { l.call(self, event); } catch (e) {}
+                            });
+                        }
+                        return true;
+                    }, 'dispatchEvent');
+
+                    this.close = cloak(function() {
+                        try {
+                            if (window.EnclaveNotificationBridge) {
+                                window.EnclaveNotificationBridge.cancelNotification(self.tag, notifId);
+                            }
+                        } catch (e) {}
+                        delete window.__activeNotifications[notifId];
+                        self.dispatchEvent(new Event('close'));
+                    }, 'close');
+
+                    window.__activeNotifications[notifId] = this;
+
+                    try {
+                        if (window.EnclaveNotificationBridge) {
+                            window.EnclaveNotificationBridge.showNotification(
+                                notifId,
+                                this.title,
+                                this.body,
+                                this.tag,
+                                this.icon,
+                                this.silent
+                            );
+                        }
+                    } catch (e) {
+                        setTimeout(() => {
+                            self.dispatchEvent(new Event('error'));
+                        }, 0);
+                        return;
+                    }
+
+                    setTimeout(() => {
+                        self.dispatchEvent(new Event('show'));
+                    }, 50);
+                }
+
+                const getPerm = cloak(function() {
+                    try {
+                        if (window.EnclaveNotificationBridge) {
+                            return window.EnclaveNotificationBridge.getPermissionStatus();
+                        }
+                        return 'granted';
+                    } catch (e) {
+                        return 'granted';
+                    }
+                }, 'get permission');
+
+                Object.defineProperty(Notification, 'permission', {
+                    get: getPerm,
+                    enumerable: true,
+                    configurable: true
+                });
+
+                Notification.maxActions = 2;
+
+                window._pendingPermRequests = window._pendingPermRequests || {};
+
+                Notification.requestPermission = cloak(function(callback) {
+                    return new Promise((resolve) => {
+                        const reqId = 'perm_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+                        window._pendingPermRequests[reqId] = (status) => {
+                            if (typeof callback === 'function') {
+                                try { callback(status); } catch (e) {}
+                            }
+                            resolve(status);
+                        };
+                        try {
+                            if (window.EnclaveNotificationBridge) {
+                                window.EnclaveNotificationBridge.requestPermission(reqId);
+                            } else {
+                                window._pendingPermRequests[reqId]('granted');
+                            }
+                        } catch (e) {
+                            window._pendingPermRequests[reqId]('granted');
+                        }
+                    });
+                }, 'requestPermission');
+
+                cloak(Notification, 'Notification');
+                Notification.prototype.constructor = Notification;
+
+                window.Notification = Notification;
+
+                // Dispatched from Android MainActivity on notification click
+                window.__dispatchNotificationClick = function(id) {
+                    const notif = window.__activeNotifications[id];
+                    if (notif) {
+                        const ev = new Event('click');
+                        if (typeof notif.onclick === 'function') {
+                            try { notif.onclick(ev); } catch (e) {}
+                        }
+                        notif.dispatchEvent(ev);
+                    }
+                };
+
+                // ServiceWorker showNotification polyfill
+                if (typeof ServiceWorkerRegistration !== 'undefined') {
+                    if (!ServiceWorkerRegistration.prototype.showNotification) {
+                        ServiceWorkerRegistration.prototype.showNotification = cloak(function(title, options) {
+                            new Notification(title, options);
+                            return Promise.resolve();
+                        }, 'showNotification');
+                    }
+                    if (!ServiceWorkerRegistration.prototype.getNotifications) {
+                        ServiceWorkerRegistration.prototype.getNotifications = cloak(function(options) {
+                            return Promise.resolve([]);
+                        }, 'getNotifications');
+                    }
+                }
+
+                // Permissions API query interception for 'notifications'
+                if (navigator.permissions && navigator.permissions.query) {
+                    const origQuery = navigator.permissions.query;
+                    navigator.permissions.query = cloak(function(desc) {
+                        if (desc && desc.name === 'notifications') {
+                            const perm = Notification.permission;
+                            const stateVal = perm === 'granted' ? 'granted' : (perm === 'denied' ? 'denied' : 'prompt');
+                            return Promise.resolve({
+                                state: stateVal,
+                                name: 'notifications',
+                                onchange: null,
+                                addEventListener: function() {},
+                                removeEventListener: function() {},
+                                dispatchEvent: function() { return false; }
+                            });
+                        }
+                        return origQuery.call(this, desc);
+                    }, 'query');
+                }
+            } catch (e) {}
         })();
         """.trimIndent()
     }
@@ -4125,7 +4384,235 @@ object AntiFingerprintHardener {
 
 ---
 
-### 2.9. `app/src/main/java/com/corp/enclaveshield/accounts/AccountProfile.kt`
+### 2.9. `app/src/main/java/com/corp/enclaveshield/notifications/ClaudeCageNotificationBridge.kt`
+**Role:** W3C Web Notification API Bridge: secure origin validation, heads-up system alerts, BigTextStyle and runtime permissions
+
+```kotlin
+package com.corp.enclaveshield.notifications
+
+import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import android.util.Log
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
+import com.corp.enclaveshield.MainActivity
+import com.corp.enclaveshield.R
+import com.corp.enclaveshield.telemetry.SecurityAuditLogger
+import com.corp.enclaveshield.ui.AppIconManager
+import com.corp.enclaveshield.ui.AppIconOption
+import java.util.Locale
+
+/**
+ * W3C Web Notification API Bridge for Corporate Portal in Chromium WebView.
+ *
+ * Provides a secure, zero-leak bridge between web JavaScript (window.Notification)
+ * and the Android system NotificationManager.
+ */
+class EnclaveNotificationBridge(
+    private val activity: Activity,
+    private val getActiveUrl: () -> String?,
+    private val webViewProvider: () -> WebView?,
+    private val onRequestPermission: (reqId: String) -> Unit,
+    private val auditLogger: SecurityAuditLogger,
+    private val appIconManager: AppIconManager? = null
+) {
+    companion object {
+        const val TAG = "EnclaveNotif"
+        const val CHANNEL_ID = "enclave_notifications"
+        const val EXTRA_NOTIFICATION_ID = "extra_enclave_notification_id"
+
+        val ALLOWED_NOTIFICATION_ORIGINS = setOf(
+            "https://portal.internal-enterprise.net",
+            "https://internal-enterprise.net",
+            "https://corporate portal.com"
+        )
+
+        fun isOriginPermitted(url: String?): Boolean {
+            if (url.isNullOrBlank()) return false
+            val lower = url.trim().lowercase(Locale.ROOT)
+            return ALLOWED_NOTIFICATION_ORIGINS.any { allowed ->
+                lower == allowed || lower.startsWith("$allowed/") || lower.startsWith("$allowed:")
+            }
+        }
+    }
+
+    fun hasNotificationPermission(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(
+                activity,
+                android.Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED &&
+            NotificationManagerCompat.from(activity).areNotificationsEnabled()
+        } else {
+            NotificationManagerCompat.from(activity).areNotificationsEnabled()
+        }
+    }
+
+    @JavascriptInterface
+    fun getPermissionStatus(): String {
+        val url = getActiveUrl()
+        if (!isOriginPermitted(url)) return "denied"
+        return if (hasNotificationPermission()) "granted" else "default"
+    }
+
+    @JavascriptInterface
+    fun requestPermission(reqId: String) {
+        val url = getActiveUrl()
+        if (!isOriginPermitted(url)) {
+            resolveJsPermission(reqId, "denied")
+            return
+        }
+        activity.runOnUiThread {
+            if (hasNotificationPermission()) {
+                resolveJsPermission(reqId, "granted")
+            } else {
+                onRequestPermission(reqId)
+            }
+        }
+    }
+
+    @JavascriptInterface
+    fun showNotification(
+        notifId: Int,
+        title: String,
+        body: String,
+        tag: String?,
+        iconUrl: String?,
+        silent: Boolean
+    ) {
+        val url = getActiveUrl()
+        if (!isOriginPermitted(url)) {
+            auditLogger.logWarning("Notification", "Blocked notification from unauthorized origin: $url")
+            return
+        }
+
+        activity.runOnUiThread {
+            if (!hasNotificationPermission()) {
+                auditLogger.logWarning("Notification", "Cannot display notification $notifId: permission not granted")
+                return@runOnUiThread
+            }
+
+            try {
+                ensureNotificationChannel(activity)
+
+                val cleanTitle = title.trim().take(128).ifBlank { "Corporate Portal" }
+                val cleanBody = body.trim().take(2048)
+                val cleanTag = tag?.trim()?.take(64)
+
+                val intent = Intent(activity, MainActivity::class.java).apply {
+                    action = Intent.ACTION_MAIN
+                    addCategory(Intent.CATEGORY_LAUNCHER)
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    putExtra(EXTRA_NOTIFICATION_ID, notifId.toString())
+                }
+
+                val pendingIntent = PendingIntent.getActivity(
+                    activity,
+                    notifId,
+                    intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+
+                val iconRes = if (appIconManager?.getCurrentIcon() == AppIconOption.VARIANT_2) {
+                    R.mipmap.ic_launcher_opt2
+                } else {
+                    R.mipmap.ic_launcher_opt1
+                }
+
+                val builder = NotificationCompat.Builder(activity, CHANNEL_ID)
+                    .setSmallIcon(iconRes)
+                    .setContentTitle(cleanTitle)
+                    .setContentText(cleanBody)
+                    .setStyle(NotificationCompat.BigTextStyle().bigText(cleanBody))
+                    .setPriority(if (silent) NotificationCompat.PRIORITY_LOW else NotificationCompat.PRIORITY_HIGH)
+                    .setAutoCancel(true)
+                    .setContentIntent(pendingIntent)
+
+                if (!silent) {
+                    builder.setDefaults(NotificationCompat.DEFAULT_ALL)
+                }
+
+                val nm = NotificationManagerCompat.from(activity)
+                if (cleanTag.isNullOrBlank()) {
+                    nm.notify(notifId, builder.build())
+                } else {
+                    nm.notify(cleanTag, notifId, builder.build())
+                }
+
+                auditLogger.logInfo("Notification", "Notification displayed: id=$notifId title='$cleanTitle' tag=$cleanTag")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to display notification", e)
+                auditLogger.logWarning("Notification", "Failed to display notification $notifId: ${e.message}")
+            }
+        }
+    }
+
+    @JavascriptInterface
+    fun cancelNotification(tag: String?, notifId: Int) {
+        val url = getActiveUrl()
+        if (!isOriginPermitted(url)) return
+        activity.runOnUiThread {
+            try {
+                val nm = NotificationManagerCompat.from(activity)
+                val cleanTag = tag?.trim()
+                if (cleanTag.isNullOrBlank()) {
+                    nm.cancel(notifId)
+                } else {
+                    nm.cancel(cleanTag, notifId)
+                }
+                auditLogger.logInfo("Notification", "Notification cancelled: id=$notifId tag=$cleanTag")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to cancel notification", e)
+            }
+        }
+    }
+
+    fun resolveJsPermission(reqId: String, status: String) {
+        activity.runOnUiThread {
+            val safeReqId = reqId.replace("\\", "\\\\").replace("'", "\\'")
+            val safeStatus = status.replace("\\", "\\\\").replace("'", "\\'")
+            val js = "window._pendingPermRequests?.['$safeReqId']?.('$safeStatus'); delete window._pendingPermRequests?.['$safeReqId'];"
+            webViewProvider()?.evaluateJavascript(js, null)
+        }
+    }
+
+    fun ensureNotificationChannel(context: Context) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val nm = context.getSystemService(NotificationManager::class.java) ?: return
+            val existing = nm.getNotificationChannel(CHANNEL_ID)
+            if (existing == null) {
+                val channel = NotificationChannel(
+                    CHANNEL_ID,
+                    "Corporate Portal Notifications",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    description = "Notifications for Corporate Portal responses and completed messages"
+                    enableLights(true)
+                    enableVibration(true)
+                    setShowBadge(true)
+                    lockscreenVisibility = Notification.VISIBILITY_PRIVATE
+                }
+                nm.createNotificationChannel(channel)
+            }
+        }
+    }
+}
+
+```
+
+---
+
+### 2.10. `app/src/main/java/com/corp/enclaveshield/accounts/AccountProfile.kt`
 **Role:** Profile data models
 
 ```kotlin
@@ -4165,7 +4652,7 @@ data class AccountProfile(
 
 ---
 
-### 2.10. `app/src/main/java/com/corp/enclaveshield/accounts/AccountProfileManager.kt`
+### 2.11. `app/src/main/java/com/corp/enclaveshield/accounts/AccountProfileManager.kt`
 **Role:** Multi-account profile container manager with safe deletion switching
 
 ```kotlin
@@ -4365,7 +4852,7 @@ class AccountProfileManager(
 
 ---
 
-### 2.11. `app/src/main/java/com/corp/enclaveshield/accounts/AccountCookieJarFallback.kt`
+### 2.12. `app/src/main/java/com/corp/enclaveshield/accounts/AccountCookieJarFallback.kt`
 **Role:** AES-256-GCM Keystore cookie jar with system IV generation & profile AAD binding
 
 ```kotlin
@@ -4545,7 +5032,7 @@ class AccountCookieJarFallback(
 
 ---
 
-### 2.12. `app/src/main/java/com/corp/enclaveshield/accounts/AccountProfileJsonCodec.kt`
+### 2.13. `app/src/main/java/com/corp/enclaveshield/accounts/AccountProfileJsonCodec.kt`
 **Role:** org.json serialization for profile storage
 
 ```kotlin
@@ -4598,7 +5085,7 @@ object AccountProfileJsonCodec {
 
 ---
 
-### 2.13. `app/src/main/java/com/corp/enclaveshield/telemetry/SecurityAuditLogger.kt`
+### 2.14. `app/src/main/java/com/corp/enclaveshield/telemetry/SecurityAuditLogger.kt`
 **Role:** Security telemetry, ring buffer, markdown report generator
 
 ```kotlin
@@ -4951,7 +5438,7 @@ class SecurityAuditLogger(context: Context) {
 
 ---
 
-### 2.14. `app/src/main/java/com/corp/enclaveshield/ui/AppIconManager.kt`
+### 2.15. `app/src/main/java/com/corp/enclaveshield/ui/AppIconManager.kt`
 **Role:** Launcher alias switcher
 
 ```kotlin
@@ -5035,7 +5522,7 @@ class AppIconManager(private val context: Context) {
 
 ---
 
-### 2.15. `app/src/main/java/com/corp/enclaveshield/ui/UiLanguageManager.kt`
+### 2.16. `app/src/main/java/com/corp/enclaveshield/ui/UiLanguageManager.kt`
 **Role:** Language state management
 
 ```kotlin
@@ -5094,7 +5581,7 @@ class UiLanguageManager(context: Context) {
 
 ---
 
-### 2.16. `app/src/main/java/com/corp/enclaveshield/ui/UiStrings.kt`
+### 2.17. `app/src/main/java/com/corp/enclaveshield/ui/UiStrings.kt`
 **Role:** Bilingual string catalog
 
 ```kotlin
@@ -5469,7 +5956,7 @@ object UiStrings {
 
 ---
 
-### 2.17. `app/src/test/java/com/corp/enclaveshield/net/TunnelDnsResolverTest.kt`
+### 2.18. `app/src/test/java/com/corp/enclaveshield/net/TunnelDnsResolverTest.kt`
 **Role:** DNS resolver unit tests: Watchdog, StaleCache, Single-Flight, RFC 1035 TCP
 
 ```kotlin
@@ -5827,7 +6314,7 @@ class TunnelDnsResolverTest {
 
 ---
 
-### 2.18. `app/src/test/java/com/corp/enclaveshield/net/VpnGatekeeperProxyTest.kt`
+### 2.19. `app/src/test/java/com/corp/enclaveshield/net/VpnGatekeeperProxyTest.kt`
 **Role:** SOCKS5 proxy unit tests: Fail-closed killswitch, Allowlist, Private IP block, Regional Guard
 
 ```kotlin
@@ -6244,8 +6731,8 @@ class VpnGatekeeperProxyTest {
 
 ---
 
-### 2.19. `app/src/test/java/com/corp/enclaveshield/security/AntiFingerprintHardenerTest.kt`
-**Role:** Anti-fingerprinting unit tests: Canvas offscreen clone, toString, TTS, Intl, Webdriver
+### 2.20. `app/src/test/java/com/corp/enclaveshield/security/AntiFingerprintHardenerTest.kt`
+**Role:** Anti-fingerprinting unit tests: Canvas offscreen clone, toString, TTS, Intl, Webdriver, Web Notifications
 
 ```kotlin
 package com.corp.enclaveshield.security
@@ -6357,13 +6844,78 @@ class AntiFingerprintHardenerTest {
         assertTrue("Must scan for non-transparent pixel (data[i + 3] > 0)", js.contains("data[i + 3] > 0"))
         assertTrue("Must apply noise to targetIdx", js.contains("data[targetIdx] = (data[targetIdx] + NOISE_OFFSET) % 256"))
     }
+
+    @Test
+    fun documentStartJs_w3cNotificationApiPolyfillInjectedAndCloaked() {
+        val js = AntiFingerprintHardener.DOCUMENT_START_JS
+
+        // Polyfill presence
+        assertTrue("Must declare Notification constructor", js.contains("function Notification(title, options)"))
+        assertTrue("Must define Notification.permission getter", js.contains("Object.defineProperty(Notification, 'permission'"))
+        assertTrue("Must define Notification.requestPermission", js.contains("Notification.requestPermission = cloak("))
+        assertTrue("Must define Notification.maxActions", js.contains("Notification.maxActions = 2"))
+        assertTrue("Must wire EnclaveNotificationBridge", js.contains("window.EnclaveNotificationBridge"))
+        assertTrue("Must wire __dispatchNotificationClick", js.contains("window.__dispatchNotificationClick = function(id)"))
+
+        // Cloaking
+        assertTrue("Must cloak Notification constructor", js.contains("cloak(Notification, 'Notification')"))
+        assertTrue("Must cloak requestPermission", js.contains("'requestPermission'"))
+        assertTrue("Must cloak Notification.prototype.close", js.contains("'close'"))
+
+        // ServiceWorker & Permissions API
+        assertTrue("Must polyfill ServiceWorkerRegistration showNotification", js.contains("ServiceWorkerRegistration.prototype.showNotification = cloak("))
+        assertTrue("Must intercept navigator.permissions.query", js.contains("navigator.permissions.query = cloak("))
+    }
 }
 
 ```
 
 ---
 
-### 2.20. `app/src/test/java/com/corp/enclaveshield/accounts/AccountProfileManagerTest.kt`
+### 2.21. `app/src/test/java/com/corp/enclaveshield/notifications/ClaudeCageNotificationBridgeTest.kt`
+**Role:** Notification bridge unit tests: Origin validation, channel parameters
+
+```kotlin
+package com.corp.enclaveshield.notifications
+
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class EnclaveNotificationBridgeTest {
+
+    @Test
+    fun isOriginPermitted_allowsCorporate PortalAndEnterprise CorpOrigins() {
+        assertTrue(EnclaveNotificationBridge.isOriginPermitted("https://portal.internal-enterprise.net"))
+        assertTrue(EnclaveNotificationBridge.isOriginPermitted("https://portal.internal-enterprise.net/"))
+        assertTrue(EnclaveNotificationBridge.isOriginPermitted("https://portal.internal-enterprise.net/chat/abc-123"))
+        assertTrue(EnclaveNotificationBridge.isOriginPermitted("https://internal-enterprise.net"))
+        assertTrue(EnclaveNotificationBridge.isOriginPermitted("https://internal-enterprise.net/research"))
+        assertTrue(EnclaveNotificationBridge.isOriginPermitted("https://corporate portal.com"))
+    }
+
+    @Test
+    fun isOriginPermitted_rejectsUnauthorizedOrigins() {
+        assertFalse(EnclaveNotificationBridge.isOriginPermitted("https://google.com"))
+        assertFalse(EnclaveNotificationBridge.isOriginPermitted("https://evil-portal.internal-enterprise.net"))
+        assertFalse(EnclaveNotificationBridge.isOriginPermitted("http://portal.internal-enterprise.net"))
+        assertFalse(EnclaveNotificationBridge.isOriginPermitted("https://portal.internal-enterprise.net.attacker.com"))
+        assertFalse(EnclaveNotificationBridge.isOriginPermitted(""))
+        assertFalse(EnclaveNotificationBridge.isOriginPermitted(null))
+    }
+
+    @Test
+    fun constants_verifyChannelAndExtra() {
+        assertTrue(EnclaveNotificationBridge.CHANNEL_ID == "enclave_notifications")
+        assertTrue(EnclaveNotificationBridge.EXTRA_NOTIFICATION_ID == "extra_enclave_notification_id")
+    }
+}
+
+```
+
+---
+
+### 2.22. `app/src/test/java/com/corp/enclaveshield/accounts/AccountProfileManagerTest.kt`
 **Role:** Account profile manager unit tests
 
 ```kotlin
@@ -6699,7 +7251,7 @@ class FakeSharedPreferences : SharedPreferences {
 
 ---
 
-### 2.21. `app/src/test/java/com/corp/enclaveshield/telemetry/SecurityAuditLoggerTest.kt`
+### 2.23. `app/src/test/java/com/corp/enclaveshield/telemetry/SecurityAuditLoggerTest.kt`
 **Role:** Audit logger unit tests
 
 ```kotlin

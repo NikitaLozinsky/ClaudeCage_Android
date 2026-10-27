@@ -42,6 +42,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -55,6 +56,7 @@ import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import com.example.claudecageand.accounts.AccountProfile
 import com.example.claudecageand.net.VpnTunnelState
+import com.example.claudecageand.notifications.ClaudeCageNotificationBridge
 import com.example.claudecageand.security.AntiFingerprintHardener
 import com.example.claudecageand.ui.AppIconOption
 import com.example.claudecageand.ui.UiLanguage
@@ -66,6 +68,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Main application activity hosting an isolated WebView strictly bound to the in-process
@@ -171,6 +174,27 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val pendingNotificationPermissionRequests = ConcurrentHashMap<String, (String) -> Unit>()
+    private var notificationBridge: ClaudeCageNotificationBridge? = null
+
+    private val requestNotificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted: Boolean ->
+        val status = if (isGranted) "granted" else "denied"
+        if (isGranted) {
+            Log.i(TAG, "POST_NOTIFICATIONS permission granted")
+            app.auditLogger.logInfo("Notification", "POST_NOTIFICATIONS granted by user")
+        } else {
+            Log.w(TAG, "POST_NOTIFICATIONS permission denied")
+            app.auditLogger.logWarning("Notification", "POST_NOTIFICATIONS denied by user")
+        }
+        val reqIds = ArrayList(pendingNotificationPermissionRequests.keys)
+        reqIds.forEach { reqId ->
+            pendingNotificationPermissionRequests.remove(reqId)?.invoke(status)
+            notificationBridge?.resolveJsPermission(reqId, status)
+        }
+    }
+
     private class SafeDownloadBridge(
         private val getActiveUrl: () -> String?,
         private val onDownloaded: (ByteArray, String, String) -> Unit,
@@ -254,6 +278,14 @@ class MainActivity : AppCompatActivity() {
 
         // Configure strict ProxyController before instantiating WebView
         applyProxyOverrideAndInitialize(proxyPort)
+
+        // Request notification runtime permission on Android 13+ (API 33+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                requestNotificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+        handleNotificationIntent(intent)
 
         // Observe dead tunnel unresponsive warning (Amber state)
         lifecycleScope.launch {
@@ -495,6 +527,20 @@ class MainActivity : AppCompatActivity() {
         ClaudeCageApp.enforceUsLocaleAndTimezone(this)
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleNotificationIntent(intent)
+    }
+
+    private fun handleNotificationIntent(intent: Intent?) {
+        val notifId = intent?.getStringExtra(ClaudeCageNotificationBridge.EXTRA_NOTIFICATION_ID)
+        if (!notifId.isNullOrBlank()) {
+            val safeId = notifId.replace("\\", "\\\\").replace("'", "\\'")
+            webView?.evaluateJavascript("window.__dispatchNotificationClick?.('$safeId');", null)
+        }
+    }
+
     private fun applyProxyOverrideAndInitialize(proxyPort: Int) {
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
             val err = "FATAL SECURITY ERROR: WebViewFeature.PROXY_OVERRIDE is not supported on this device!"
@@ -684,6 +730,29 @@ class MainActivity : AppCompatActivity() {
             ),
             "ClaudeCageDownload"
         )
+
+        // Wire W3C Web Notification Bridge
+        val notifBridge = ClaudeCageNotificationBridge(
+            activity = this,
+            getActiveUrl = { wv.url },
+            webViewProvider = { webView },
+            onRequestPermission = { reqId ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    pendingNotificationPermissionRequests[reqId] = { status ->
+                        notificationBridge?.resolveJsPermission(reqId, status)
+                    }
+                    requestNotificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                } else {
+                    val enabled = NotificationManagerCompat.from(this).areNotificationsEnabled()
+                    notificationBridge?.resolveJsPermission(reqId, if (enabled) "granted" else "denied")
+                }
+            },
+            auditLogger = app.auditLogger,
+            appIconManager = app.appIconManager
+        )
+        notificationBridge = notifBridge
+        notifBridge.ensureNotificationChannel(this)
+        wv.addJavascriptInterface(notifBridge, "ClaudeCageNotificationBridge")
 
         wv.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
             val filename = URLUtil.guessFileName(url, contentDisposition, mimeType ?: "text/plain")

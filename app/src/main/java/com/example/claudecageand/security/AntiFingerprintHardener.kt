@@ -362,6 +362,194 @@ object AntiFingerprintHardener {
                     }
                 }
             } catch (e) {}
+
+            // 11. W3C Web Notification API Polyfill & Native Bridge
+            try {
+                let activeNotificationId = 0;
+                window.__activeNotifications = window.__activeNotifications || {};
+
+                function Notification(title, options) {
+                    if (!(this instanceof Notification)) {
+                        throw new TypeError("Failed to construct 'Notification': Please use the 'new' operator.");
+                    }
+                    if (arguments.length === 0) {
+                        throw new TypeError("Failed to construct 'Notification': 1 argument required, but only 0 present.");
+                    }
+
+                    const self = this;
+                    const notifId = ++activeNotificationId;
+                    const opts = options || {};
+
+                    this.title = String(title);
+                    this.body = opts.body ? String(opts.body) : '';
+                    this.tag = opts.tag ? String(opts.tag) : ('notif_' + notifId);
+                    this.icon = opts.icon ? String(opts.icon) : '';
+                    this.data = opts.data !== undefined ? opts.data : null;
+                    this.silent = Boolean(opts.silent);
+                    this.timestamp = Date.now();
+
+                    this.onclick = null;
+                    this.onshow = null;
+                    this.onerror = null;
+                    this.onclose = null;
+
+                    this._listeners = {};
+                    this.addEventListener = cloak(function(type, listener) {
+                        if (typeof listener !== 'function') return;
+                        self._listeners[type] = self._listeners[type] || [];
+                        self._listeners[type].push(listener);
+                    }, 'addEventListener');
+
+                    this.removeEventListener = cloak(function(type, listener) {
+                        if (!self._listeners[type]) return;
+                        self._listeners[type] = self._listeners[type].filter(l => l !== listener);
+                    }, 'removeEventListener');
+
+                    this.dispatchEvent = cloak(function(event) {
+                        const type = event && event.type;
+                        if (!type) return false;
+                        const handler = self['on' + type];
+                        if (typeof handler === 'function') {
+                            try { handler.call(self, event); } catch (e) {}
+                        }
+                        const list = self._listeners[type];
+                        if (list) {
+                            list.forEach(l => {
+                                try { l.call(self, event); } catch (e) {}
+                            });
+                        }
+                        return true;
+                    }, 'dispatchEvent');
+
+                    this.close = cloak(function() {
+                        try {
+                            if (window.ClaudeCageNotificationBridge) {
+                                window.ClaudeCageNotificationBridge.cancelNotification(self.tag, notifId);
+                            }
+                        } catch (e) {}
+                        delete window.__activeNotifications[notifId];
+                        self.dispatchEvent(new Event('close'));
+                    }, 'close');
+
+                    window.__activeNotifications[notifId] = this;
+
+                    try {
+                        if (window.ClaudeCageNotificationBridge) {
+                            window.ClaudeCageNotificationBridge.showNotification(
+                                notifId,
+                                this.title,
+                                this.body,
+                                this.tag,
+                                this.icon,
+                                this.silent
+                            );
+                        }
+                    } catch (e) {
+                        setTimeout(() => {
+                            self.dispatchEvent(new Event('error'));
+                        }, 0);
+                        return;
+                    }
+
+                    setTimeout(() => {
+                        self.dispatchEvent(new Event('show'));
+                    }, 50);
+                }
+
+                const getPerm = cloak(function() {
+                    try {
+                        if (window.ClaudeCageNotificationBridge) {
+                            return window.ClaudeCageNotificationBridge.getPermissionStatus();
+                        }
+                        return 'granted';
+                    } catch (e) {
+                        return 'granted';
+                    }
+                }, 'get permission');
+
+                Object.defineProperty(Notification, 'permission', {
+                    get: getPerm,
+                    enumerable: true,
+                    configurable: true
+                });
+
+                Notification.maxActions = 2;
+
+                window._pendingPermRequests = window._pendingPermRequests || {};
+
+                Notification.requestPermission = cloak(function(callback) {
+                    return new Promise((resolve) => {
+                        const reqId = 'perm_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+                        window._pendingPermRequests[reqId] = (status) => {
+                            if (typeof callback === 'function') {
+                                try { callback(status); } catch (e) {}
+                            }
+                            resolve(status);
+                        };
+                        try {
+                            if (window.ClaudeCageNotificationBridge) {
+                                window.ClaudeCageNotificationBridge.requestPermission(reqId);
+                            } else {
+                                window._pendingPermRequests[reqId]('granted');
+                            }
+                        } catch (e) {
+                            window._pendingPermRequests[reqId]('granted');
+                        }
+                    });
+                }, 'requestPermission');
+
+                cloak(Notification, 'Notification');
+                Notification.prototype.constructor = Notification;
+
+                window.Notification = Notification;
+
+                // Dispatched from Android MainActivity on notification click
+                window.__dispatchNotificationClick = function(id) {
+                    const notif = window.__activeNotifications[id];
+                    if (notif) {
+                        const ev = new Event('click');
+                        if (typeof notif.onclick === 'function') {
+                            try { notif.onclick(ev); } catch (e) {}
+                        }
+                        notif.dispatchEvent(ev);
+                    }
+                };
+
+                // ServiceWorker showNotification polyfill
+                if (typeof ServiceWorkerRegistration !== 'undefined') {
+                    if (!ServiceWorkerRegistration.prototype.showNotification) {
+                        ServiceWorkerRegistration.prototype.showNotification = cloak(function(title, options) {
+                            new Notification(title, options);
+                            return Promise.resolve();
+                        }, 'showNotification');
+                    }
+                    if (!ServiceWorkerRegistration.prototype.getNotifications) {
+                        ServiceWorkerRegistration.prototype.getNotifications = cloak(function(options) {
+                            return Promise.resolve([]);
+                        }, 'getNotifications');
+                    }
+                }
+
+                // Permissions API query interception for 'notifications'
+                if (navigator.permissions && navigator.permissions.query) {
+                    const origQuery = navigator.permissions.query;
+                    navigator.permissions.query = cloak(function(desc) {
+                        if (desc && desc.name === 'notifications') {
+                            const perm = Notification.permission;
+                            const stateVal = perm === 'granted' ? 'granted' : (perm === 'denied' ? 'denied' : 'prompt');
+                            return Promise.resolve({
+                                state: stateVal,
+                                name: 'notifications',
+                                onchange: null,
+                                addEventListener: function() {},
+                                removeEventListener: function() {},
+                                dispatchEvent: function() { return false; }
+                            });
+                        }
+                        return origQuery.call(this, desc);
+                    }, 'query');
+                }
+            } catch (e) {}
         })();
         """.trimIndent()
     }

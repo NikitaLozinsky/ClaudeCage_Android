@@ -107,4 +107,26 @@ class AntiFingerprintHardenerTest {
         assertTrue("Must scan for non-transparent pixel (data[i + 3] > 0)", js.contains("data[i + 3] > 0"))
         assertTrue("Must apply noise to targetIdx", js.contains("data[targetIdx] = (data[targetIdx] + NOISE_OFFSET) % 256"))
     }
+
+    @Test
+    fun documentStartJs_w3cNotificationApiPolyfillInjectedAndCloaked() {
+        val js = AntiFingerprintHardener.DOCUMENT_START_JS
+
+        // Polyfill presence
+        assertTrue("Must declare Notification constructor", js.contains("function Notification(title, options)"))
+        assertTrue("Must define Notification.permission getter", js.contains("Object.defineProperty(Notification, 'permission'"))
+        assertTrue("Must define Notification.requestPermission", js.contains("Notification.requestPermission = cloak("))
+        assertTrue("Must define Notification.maxActions", js.contains("Notification.maxActions = 2"))
+        assertTrue("Must wire ClaudeCageNotificationBridge", js.contains("window.ClaudeCageNotificationBridge"))
+        assertTrue("Must wire __dispatchNotificationClick", js.contains("window.__dispatchNotificationClick = function(id)"))
+
+        // Cloaking
+        assertTrue("Must cloak Notification constructor", js.contains("cloak(Notification, 'Notification')"))
+        assertTrue("Must cloak requestPermission", js.contains("'requestPermission'"))
+        assertTrue("Must cloak Notification.prototype.close", js.contains("'close'"))
+
+        // ServiceWorker & Permissions API
+        assertTrue("Must polyfill ServiceWorkerRegistration showNotification", js.contains("ServiceWorkerRegistration.prototype.showNotification = cloak("))
+        assertTrue("Must intercept navigator.permissions.query", js.contains("navigator.permissions.query = cloak("))
+    }
 }

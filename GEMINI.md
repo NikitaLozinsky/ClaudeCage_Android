@@ -96,6 +96,8 @@ app/src/main/java/com/example/claudecageand/
 │   ├── VpnGatekeeperProxy.kt             # SOCKS5 шлюз: Allowlist доменов, private IP filter, relay thread pool, generational sockets
 │   ├── VpnStateMonitor.kt                # Мониторинг VPN: non-null Network, generation counter, bindProcessToNetwork, TunnelListener
 │   └── VpnTunnelState.kt                 # Sealed class состояний: Connected (tunIpv4, network, iface, generation) vs Disconnected
+├── notifications/
+│   └── ClaudeCageNotificationBridge.kt   # W3C Web Notification Bridge: JS-bridge, валидация origin, heads-up системные уведомления
 ├── security/
 │   └── AntiFingerprintHardener.kt        # Document-Start JS: WebRTC Kill-Switch, offscreen Canvas farbling, toString cloaking, TTS/Intl lock
 ├── telemetry/
@@ -177,6 +179,22 @@ app/src/main/java/com/example/claudecageand/
 - **Карточный UI и просмотр версий компонентов (`ComponentVersions`).**
 - **Защита Recents (`FLAG_SECURE`):** предотвращение скриншотов и превью в диспетчере задач.
 
+### 4.6. W3C Web Notification API и Нативный Шлюз `ClaudeCageNotificationBridge.kt`
+- **Проблема WebView:** Chromium WebView в Android штатно не реализует спецификацию W3C Notifications API (`window.Notification` отсутствует, вызовы `requestPermission` блокируются).
+- **Полифилл Document-Start JS:**
+  - Полная реализация `window.Notification`: конструктор, `permission` (getter), `requestPermission(callback)`, `maxActions = 2`, `close()`.
+  - Все методы замаскированы через `cloak` (`[native code]`).
+  - Полифилл `ServiceWorkerRegistration.prototype.showNotification` и `getNotifications`.
+  - Перехват `navigator.permissions.query({ name: 'notifications' })`.
+- **Нативный Шлюз `ClaudeCageNotificationBridge`:**
+  - Проверка происхождения (`isOriginPermitted`): разрешены только `https://claude.ai`, `https://anthropic.com`, `https://claude.com` (с защитой от суффиксных атак).
+  - Управление каналом уведомлений: `NotificationChannel` с `IMPORTANCE_HIGH` (звук, вибрация, всплывающие Heads-Up баннеры).
+  - Раскрывающийся текст ответа: `NotificationCompat.BigTextStyle`.
+  - Динамическая иконка в зависимости от выбранного варианта в `AppIconManager`.
+  - Запрос рантайм-разрешения `POST_NOTIFICATIONS` на Android 13+ (API 33-37) при запуске и по требованию из JS.
+  - Обработка клика по уведомлению: `PendingIntent` открывает `MainActivity`, `onNewIntent` передаёт `window.__dispatchNotificationClick(id)`.
+- **Правило очистки логов:** файлы телеметрии из `logs_from_app/logs.txt` анализируются агентом и немедленно удаляются после обработки, сохраняя каталог в git (`.gitkeep`).
+
 ---
 
 ## 5. Команды Сборки, Тестирования и Верификации
@@ -211,6 +229,7 @@ app/src/main/java/com/example/claudecageand/
 | `SecurityAuditLoggerTest` | `app/src/test/.../telemetry/` | Кольцевой буфер, метрики, формат Markdown отчёта, thread-safety |
 | `UiStringsAndLanguageTest` | `app/src/test/.../ui/` | Полнота двуязычных строк (RU/EN), отсутствие пустых значений, версии |
 | `AppIconManagerTest` | `app/src/test/.../ui/` | Переключение лаунчер-алиасов |
+| `ClaudeCageNotificationBridgeTest` | `app/src/test/.../notifications/` | Проверка белого списка origin, валидация суффиксов, константы каналов |
 
 ---
 

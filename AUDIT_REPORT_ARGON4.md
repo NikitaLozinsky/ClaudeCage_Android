@@ -1957,6 +1957,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -1970,6 +1971,7 @@ import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import com.example.claudecageand.accounts.AccountProfile
 import com.example.claudecageand.net.VpnTunnelState
+import com.example.claudecageand.notifications.ClaudeCageNotificationBridge
 import com.example.claudecageand.security.AntiFingerprintHardener
 import com.example.claudecageand.ui.AppIconOption
 import com.example.claudecageand.ui.UiLanguage
@@ -1981,6 +1983,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Main application activity hosting an isolated WebView strictly bound to the in-process
@@ -2086,6 +2089,27 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val pendingNotificationPermissionRequests = ConcurrentHashMap<String, (String) -> Unit>()
+    private var notificationBridge: ClaudeCageNotificationBridge? = null
+
+    private val requestNotificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted: Boolean ->
+        val status = if (isGranted) "granted" else "denied"
+        if (isGranted) {
+            Log.i(TAG, "POST_NOTIFICATIONS permission granted")
+            app.auditLogger.logInfo("Notification", "POST_NOTIFICATIONS granted by user")
+        } else {
+            Log.w(TAG, "POST_NOTIFICATIONS permission denied")
+            app.auditLogger.logWarning("Notification", "POST_NOTIFICATIONS denied by user")
+        }
+        val reqIds = ArrayList(pendingNotificationPermissionRequests.keys)
+        reqIds.forEach { reqId ->
+            pendingNotificationPermissionRequests.remove(reqId)?.invoke(status)
+            notificationBridge?.resolveJsPermission(reqId, status)
+        }
+    }
+
     private class SafeDownloadBridge(
         private val getActiveUrl: () -> String?,
         private val onDownloaded: (ByteArray, String, String) -> Unit,
@@ -2169,6 +2193,14 @@ class MainActivity : AppCompatActivity() {
 
         // Configure strict ProxyController before instantiating WebView
         applyProxyOverrideAndInitialize(proxyPort)
+
+        // Request notification runtime permission on Android 13+ (API 33+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                requestNotificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+        handleNotificationIntent(intent)
 
         // Observe dead tunnel unresponsive warning (Amber state)
         lifecycleScope.launch {
@@ -2410,6 +2442,20 @@ class MainActivity : AppCompatActivity() {
         ClaudeCageApp.enforceUsLocaleAndTimezone(this)
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleNotificationIntent(intent)
+    }
+
+    private fun handleNotificationIntent(intent: Intent?) {
+        val notifId = intent?.getStringExtra(ClaudeCageNotificationBridge.EXTRA_NOTIFICATION_ID)
+        if (!notifId.isNullOrBlank()) {
+            val safeId = notifId.replace("\\", "\\\\").replace("'", "\\'")
+            webView?.evaluateJavascript("window.__dispatchNotificationClick?.('$safeId');", null)
+        }
+    }
+
     private fun applyProxyOverrideAndInitialize(proxyPort: Int) {
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
             val err = "FATAL SECURITY ERROR: WebViewFeature.PROXY_OVERRIDE is not supported on this device!"
@@ -2599,6 +2645,29 @@ class MainActivity : AppCompatActivity() {
             ),
             "ClaudeCageDownload"
         )
+
+        // Wire W3C Web Notification Bridge
+        val notifBridge = ClaudeCageNotificationBridge(
+            activity = this,
+            getActiveUrl = { wv.url },
+            webViewProvider = { webView },
+            onRequestPermission = { reqId ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    pendingNotificationPermissionRequests[reqId] = { status ->
+                        notificationBridge?.resolveJsPermission(reqId, status)
+                    }
+                    requestNotificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                } else {
+                    val enabled = NotificationManagerCompat.from(this).areNotificationsEnabled()
+                    notificationBridge?.resolveJsPermission(reqId, if (enabled) "granted" else "denied")
+                }
+            },
+            auditLogger = app.auditLogger,
+            appIconManager = app.appIconManager
+        )
+        notificationBridge = notifBridge
+        notifBridge.ensureNotificationChannel(this)
+        wv.addJavascriptInterface(notifBridge, "ClaudeCageNotificationBridge")
 
         wv.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
             val filename = URLUtil.guessFileName(url, contentDisposition, mimeType ?: "text/plain")
@@ -3692,7 +3761,7 @@ class ClaudeCageApp : Application() {
 ```
 
 ### 5.6. `app/src/main/java/com/example/claudecageand/security/AntiFingerprintHardener.kt`
-**Назначение и роль в безопасности:** Document-Start JS инжектор: WebRTC Kill-Switch, оффскрин-клонирование Canvas при toDataURL/toBlob (защита от разрушения холста), Function.prototype.toString cloaking через WeakMap, блокировка TTS-голосов, Intl en-US lock
+**Назначение и роль в безопасности:** Document-Start JS инжектор: WebRTC Kill-Switch, оффскрин-клонирование Canvas при toDataURL/toBlob (защита от разрушения холста), Function.prototype.toString cloaking через WeakMap, блокировка TTS-голосов, Intl en-US lock, W3C Web Notification API polyfill
 
 ```kotlin
 package com.example.claudecageand.security
@@ -4059,6 +4128,194 @@ object AntiFingerprintHardener {
                     }
                 }
             } catch (e) {}
+
+            // 11. W3C Web Notification API Polyfill & Native Bridge
+            try {
+                let activeNotificationId = 0;
+                window.__activeNotifications = window.__activeNotifications || {};
+
+                function Notification(title, options) {
+                    if (!(this instanceof Notification)) {
+                        throw new TypeError("Failed to construct 'Notification': Please use the 'new' operator.");
+                    }
+                    if (arguments.length === 0) {
+                        throw new TypeError("Failed to construct 'Notification': 1 argument required, but only 0 present.");
+                    }
+
+                    const self = this;
+                    const notifId = ++activeNotificationId;
+                    const opts = options || {};
+
+                    this.title = String(title);
+                    this.body = opts.body ? String(opts.body) : '';
+                    this.tag = opts.tag ? String(opts.tag) : ('notif_' + notifId);
+                    this.icon = opts.icon ? String(opts.icon) : '';
+                    this.data = opts.data !== undefined ? opts.data : null;
+                    this.silent = Boolean(opts.silent);
+                    this.timestamp = Date.now();
+
+                    this.onclick = null;
+                    this.onshow = null;
+                    this.onerror = null;
+                    this.onclose = null;
+
+                    this._listeners = {};
+                    this.addEventListener = cloak(function(type, listener) {
+                        if (typeof listener !== 'function') return;
+                        self._listeners[type] = self._listeners[type] || [];
+                        self._listeners[type].push(listener);
+                    }, 'addEventListener');
+
+                    this.removeEventListener = cloak(function(type, listener) {
+                        if (!self._listeners[type]) return;
+                        self._listeners[type] = self._listeners[type].filter(l => l !== listener);
+                    }, 'removeEventListener');
+
+                    this.dispatchEvent = cloak(function(event) {
+                        const type = event && event.type;
+                        if (!type) return false;
+                        const handler = self['on' + type];
+                        if (typeof handler === 'function') {
+                            try { handler.call(self, event); } catch (e) {}
+                        }
+                        const list = self._listeners[type];
+                        if (list) {
+                            list.forEach(l => {
+                                try { l.call(self, event); } catch (e) {}
+                            });
+                        }
+                        return true;
+                    }, 'dispatchEvent');
+
+                    this.close = cloak(function() {
+                        try {
+                            if (window.ClaudeCageNotificationBridge) {
+                                window.ClaudeCageNotificationBridge.cancelNotification(self.tag, notifId);
+                            }
+                        } catch (e) {}
+                        delete window.__activeNotifications[notifId];
+                        self.dispatchEvent(new Event('close'));
+                    }, 'close');
+
+                    window.__activeNotifications[notifId] = this;
+
+                    try {
+                        if (window.ClaudeCageNotificationBridge) {
+                            window.ClaudeCageNotificationBridge.showNotification(
+                                notifId,
+                                this.title,
+                                this.body,
+                                this.tag,
+                                this.icon,
+                                this.silent
+                            );
+                        }
+                    } catch (e) {
+                        setTimeout(() => {
+                            self.dispatchEvent(new Event('error'));
+                        }, 0);
+                        return;
+                    }
+
+                    setTimeout(() => {
+                        self.dispatchEvent(new Event('show'));
+                    }, 50);
+                }
+
+                const getPerm = cloak(function() {
+                    try {
+                        if (window.ClaudeCageNotificationBridge) {
+                            return window.ClaudeCageNotificationBridge.getPermissionStatus();
+                        }
+                        return 'granted';
+                    } catch (e) {
+                        return 'granted';
+                    }
+                }, 'get permission');
+
+                Object.defineProperty(Notification, 'permission', {
+                    get: getPerm,
+                    enumerable: true,
+                    configurable: true
+                });
+
+                Notification.maxActions = 2;
+
+                window._pendingPermRequests = window._pendingPermRequests || {};
+
+                Notification.requestPermission = cloak(function(callback) {
+                    return new Promise((resolve) => {
+                        const reqId = 'perm_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+                        window._pendingPermRequests[reqId] = (status) => {
+                            if (typeof callback === 'function') {
+                                try { callback(status); } catch (e) {}
+                            }
+                            resolve(status);
+                        };
+                        try {
+                            if (window.ClaudeCageNotificationBridge) {
+                                window.ClaudeCageNotificationBridge.requestPermission(reqId);
+                            } else {
+                                window._pendingPermRequests[reqId]('granted');
+                            }
+                        } catch (e) {
+                            window._pendingPermRequests[reqId]('granted');
+                        }
+                    });
+                }, 'requestPermission');
+
+                cloak(Notification, 'Notification');
+                Notification.prototype.constructor = Notification;
+
+                window.Notification = Notification;
+
+                // Dispatched from Android MainActivity on notification click
+                window.__dispatchNotificationClick = function(id) {
+                    const notif = window.__activeNotifications[id];
+                    if (notif) {
+                        const ev = new Event('click');
+                        if (typeof notif.onclick === 'function') {
+                            try { notif.onclick(ev); } catch (e) {}
+                        }
+                        notif.dispatchEvent(ev);
+                    }
+                };
+
+                // ServiceWorker showNotification polyfill
+                if (typeof ServiceWorkerRegistration !== 'undefined') {
+                    if (!ServiceWorkerRegistration.prototype.showNotification) {
+                        ServiceWorkerRegistration.prototype.showNotification = cloak(function(title, options) {
+                            new Notification(title, options);
+                            return Promise.resolve();
+                        }, 'showNotification');
+                    }
+                    if (!ServiceWorkerRegistration.prototype.getNotifications) {
+                        ServiceWorkerRegistration.prototype.getNotifications = cloak(function(options) {
+                            return Promise.resolve([]);
+                        }, 'getNotifications');
+                    }
+                }
+
+                // Permissions API query interception for 'notifications'
+                if (navigator.permissions && navigator.permissions.query) {
+                    const origQuery = navigator.permissions.query;
+                    navigator.permissions.query = cloak(function(desc) {
+                        if (desc && desc.name === 'notifications') {
+                            const perm = Notification.permission;
+                            const stateVal = perm === 'granted' ? 'granted' : (perm === 'denied' ? 'denied' : 'prompt');
+                            return Promise.resolve({
+                                state: stateVal,
+                                name: 'notifications',
+                                onchange: null,
+                                addEventListener: function() {},
+                                removeEventListener: function() {},
+                                dispatchEvent: function() { return false; }
+                            });
+                        }
+                        return origQuery.call(this, desc);
+                    }, 'query');
+                }
+            } catch (e) {}
         })();
         """.trimIndent()
     }
@@ -4084,7 +4341,233 @@ object AntiFingerprintHardener {
 
 ```
 
-### 5.7. `app/src/main/java/com/example/claudecageand/telemetry/SecurityAuditLogger.kt`
+### 5.7. `app/src/main/java/com/example/claudecageand/notifications/ClaudeCageNotificationBridge.kt`
+**Назначение и роль в безопасности:** W3C Web Notification API Bridge: нативный шлюз, валидация origin, heads-up системные уведомления, BigTextStyle и рантайм-разрешения
+
+```kotlin
+package com.example.claudecageand.notifications
+
+import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import android.util.Log
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
+import com.example.claudecageand.MainActivity
+import com.example.claudecageand.R
+import com.example.claudecageand.telemetry.SecurityAuditLogger
+import com.example.claudecageand.ui.AppIconManager
+import com.example.claudecageand.ui.AppIconOption
+import java.util.Locale
+
+/**
+ * W3C Web Notification API Bridge for Claude in Chromium WebView.
+ *
+ * Provides a secure, zero-leak bridge between web JavaScript (window.Notification)
+ * and the Android system NotificationManager.
+ */
+class ClaudeCageNotificationBridge(
+    private val activity: Activity,
+    private val getActiveUrl: () -> String?,
+    private val webViewProvider: () -> WebView?,
+    private val onRequestPermission: (reqId: String) -> Unit,
+    private val auditLogger: SecurityAuditLogger,
+    private val appIconManager: AppIconManager? = null
+) {
+    companion object {
+        const val TAG = "ClaudeCageNotif"
+        const val CHANNEL_ID = "claude_cage_notifications"
+        const val EXTRA_NOTIFICATION_ID = "extra_claude_notification_id"
+
+        val ALLOWED_NOTIFICATION_ORIGINS = setOf(
+            "https://claude.ai",
+            "https://anthropic.com",
+            "https://claude.com"
+        )
+
+        fun isOriginPermitted(url: String?): Boolean {
+            if (url.isNullOrBlank()) return false
+            val lower = url.trim().lowercase(Locale.ROOT)
+            return ALLOWED_NOTIFICATION_ORIGINS.any { allowed ->
+                lower == allowed || lower.startsWith("$allowed/") || lower.startsWith("$allowed:")
+            }
+        }
+    }
+
+    fun hasNotificationPermission(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(
+                activity,
+                android.Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED &&
+            NotificationManagerCompat.from(activity).areNotificationsEnabled()
+        } else {
+            NotificationManagerCompat.from(activity).areNotificationsEnabled()
+        }
+    }
+
+    @JavascriptInterface
+    fun getPermissionStatus(): String {
+        val url = getActiveUrl()
+        if (!isOriginPermitted(url)) return "denied"
+        return if (hasNotificationPermission()) "granted" else "default"
+    }
+
+    @JavascriptInterface
+    fun requestPermission(reqId: String) {
+        val url = getActiveUrl()
+        if (!isOriginPermitted(url)) {
+            resolveJsPermission(reqId, "denied")
+            return
+        }
+        activity.runOnUiThread {
+            if (hasNotificationPermission()) {
+                resolveJsPermission(reqId, "granted")
+            } else {
+                onRequestPermission(reqId)
+            }
+        }
+    }
+
+    @JavascriptInterface
+    fun showNotification(
+        notifId: Int,
+        title: String,
+        body: String,
+        tag: String?,
+        iconUrl: String?,
+        silent: Boolean
+    ) {
+        val url = getActiveUrl()
+        if (!isOriginPermitted(url)) {
+            auditLogger.logWarning("Notification", "Blocked notification from unauthorized origin: $url")
+            return
+        }
+
+        activity.runOnUiThread {
+            if (!hasNotificationPermission()) {
+                auditLogger.logWarning("Notification", "Cannot display notification $notifId: permission not granted")
+                return@runOnUiThread
+            }
+
+            try {
+                ensureNotificationChannel(activity)
+
+                val cleanTitle = title.trim().take(128).ifBlank { "Claude" }
+                val cleanBody = body.trim().take(2048)
+                val cleanTag = tag?.trim()?.take(64)
+
+                val intent = Intent(activity, MainActivity::class.java).apply {
+                    action = Intent.ACTION_MAIN
+                    addCategory(Intent.CATEGORY_LAUNCHER)
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    putExtra(EXTRA_NOTIFICATION_ID, notifId.toString())
+                }
+
+                val pendingIntent = PendingIntent.getActivity(
+                    activity,
+                    notifId,
+                    intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+
+                val iconRes = if (appIconManager?.getCurrentIcon() == AppIconOption.VARIANT_2) {
+                    R.mipmap.ic_launcher_opt2
+                } else {
+                    R.mipmap.ic_launcher_opt1
+                }
+
+                val builder = NotificationCompat.Builder(activity, CHANNEL_ID)
+                    .setSmallIcon(iconRes)
+                    .setContentTitle(cleanTitle)
+                    .setContentText(cleanBody)
+                    .setStyle(NotificationCompat.BigTextStyle().bigText(cleanBody))
+                    .setPriority(if (silent) NotificationCompat.PRIORITY_LOW else NotificationCompat.PRIORITY_HIGH)
+                    .setAutoCancel(true)
+                    .setContentIntent(pendingIntent)
+
+                if (!silent) {
+                    builder.setDefaults(NotificationCompat.DEFAULT_ALL)
+                }
+
+                val nm = NotificationManagerCompat.from(activity)
+                if (cleanTag.isNullOrBlank()) {
+                    nm.notify(notifId, builder.build())
+                } else {
+                    nm.notify(cleanTag, notifId, builder.build())
+                }
+
+                auditLogger.logInfo("Notification", "Notification displayed: id=$notifId title='$cleanTitle' tag=$cleanTag")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to display notification", e)
+                auditLogger.logWarning("Notification", "Failed to display notification $notifId: ${e.message}")
+            }
+        }
+    }
+
+    @JavascriptInterface
+    fun cancelNotification(tag: String?, notifId: Int) {
+        val url = getActiveUrl()
+        if (!isOriginPermitted(url)) return
+        activity.runOnUiThread {
+            try {
+                val nm = NotificationManagerCompat.from(activity)
+                val cleanTag = tag?.trim()
+                if (cleanTag.isNullOrBlank()) {
+                    nm.cancel(notifId)
+                } else {
+                    nm.cancel(cleanTag, notifId)
+                }
+                auditLogger.logInfo("Notification", "Notification cancelled: id=$notifId tag=$cleanTag")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to cancel notification", e)
+            }
+        }
+    }
+
+    fun resolveJsPermission(reqId: String, status: String) {
+        activity.runOnUiThread {
+            val safeReqId = reqId.replace("\\", "\\\\").replace("'", "\\'")
+            val safeStatus = status.replace("\\", "\\\\").replace("'", "\\'")
+            val js = "window._pendingPermRequests?.['$safeReqId']?.('$safeStatus'); delete window._pendingPermRequests?.['$safeReqId'];"
+            webViewProvider()?.evaluateJavascript(js, null)
+        }
+    }
+
+    fun ensureNotificationChannel(context: Context) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val nm = context.getSystemService(NotificationManager::class.java) ?: return
+            val existing = nm.getNotificationChannel(CHANNEL_ID)
+            if (existing == null) {
+                val channel = NotificationChannel(
+                    CHANNEL_ID,
+                    "Claude Notifications",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    description = "Notifications for Claude responses and completed messages"
+                    enableLights(true)
+                    enableVibration(true)
+                    setShowBadge(true)
+                    lockscreenVisibility = Notification.VISIBILITY_PRIVATE
+                }
+                nm.createNotificationChannel(channel)
+            }
+        }
+    }
+}
+
+```
+
+### 5.8. `app/src/main/java/com/example/claudecageand/telemetry/SecurityAuditLogger.kt`
 **Назначение и роль в безопасности:** Система аудита, кольцевой буфер телеметрии, счётчик consecutiveNetworkTimeouts и генератор Markdown-отчётов
 
 ```kotlin
@@ -4435,7 +4918,7 @@ class SecurityAuditLogger(context: Context) {
 
 ```
 
-### 5.8. `app/src/main/java/com/example/claudecageand/accounts/AccountProfileManager.kt`
+### 5.9. `app/src/main/java/com/example/claudecageand/accounts/AccountProfileManager.kt`
 **Назначение и роль в безопасности:** Менеджер мульти-аккаунтов: контейнеризация AndroidX ProfileStore и безопасное переключение профилей перед удалением
 
 ```kotlin
@@ -4633,7 +5116,7 @@ class AccountProfileManager(
 
 ```
 
-### 5.9. `app/src/main/java/com/example/claudecageand/accounts/AccountCookieJarFallback.kt`
+### 5.10. `app/src/main/java/com/example/claudecageand/accounts/AccountCookieJarFallback.kt`
 **Назначение и роль в безопасности:** Криптографический Fallback Cookie Jar с аппаратным AndroidKeyStore (AES-256-GCM с автоматической генерацией IV и привязкой AAD к profileId)
 
 ```kotlin
@@ -4811,7 +5294,7 @@ class AccountCookieJarFallback(
 
 ```
 
-### 5.10. `app/src/main/java/com/example/claudecageand/accounts/AccountProfileJsonCodec.kt`
+### 5.11. `app/src/main/java/com/example/claudecageand/accounts/AccountProfileJsonCodec.kt`
 **Назначение и роль в безопасности:** Сериализация и десериализация профилей на org.json (JSONArray/JSONObject)
 
 ```kotlin
@@ -4862,7 +5345,7 @@ object AccountProfileJsonCodec {
 
 ```
 
-### 5.11. `app/src/main/java/com/example/claudecageand/accounts/AccountProfile.kt`
+### 5.12. `app/src/main/java/com/example/claudecageand/accounts/AccountProfile.kt`
 **Назначение и роль в безопасности:** Модели данных профилей аккаунтов
 
 ```kotlin
@@ -4900,7 +5383,7 @@ data class AccountProfile(
 
 ```
 
-### 5.12. `app/build.gradle.kts`
+### 5.13. `app/build.gradle.kts`
 **Назначение и роль в безопасности:** Конфигурация сборки Gradle: зависимости, SDK targets (Min 33, Target 36), скрипт копирования APK ClaudeCage-1.2.apk
 
 ```kotlin
@@ -4995,7 +5478,7 @@ dependencies {
 
 ```
 
-### 5.13. `app/src/main/AndroidManifest.xml`
+### 5.14. `app/src/main/AndroidManifest.xml`
 **Назначение и роль в безопасности:** Манифест приложения: разрешения, лаунчер-алиасы и запрет cleartext
 
 ```xml
@@ -5005,6 +5488,8 @@ dependencies {
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
             android:name=".ClaudeCageApp"
@@ -5058,7 +5543,7 @@ dependencies {
 
 ```
 
-### 5.14. `GEMINI.md`
+### 5.15. `GEMINI.md`
 **Назначение и роль в безопасности:** Сводная база знаний, архитектурный справочник и инварианты системы для модели Gemini
 
 ```markdown
@@ -5160,6 +5645,8 @@ app/src/main/java/com/example/claudecageand/
 │   ├── VpnGatekeeperProxy.kt             # SOCKS5 шлюз: Allowlist доменов, private IP filter, relay thread pool, generational sockets
 │   ├── VpnStateMonitor.kt                # Мониторинг VPN: non-null Network, generation counter, bindProcessToNetwork, TunnelListener
 │   └── VpnTunnelState.kt                 # Sealed class состояний: Connected (tunIpv4, network, iface, generation) vs Disconnected
+├── notifications/
+│   └── ClaudeCageNotificationBridge.kt   # W3C Web Notification Bridge: JS-bridge, валидация origin, heads-up системные уведомления
 ├── security/
 │   └── AntiFingerprintHardener.kt        # Document-Start JS: WebRTC Kill-Switch, offscreen Canvas farbling, toString cloaking, TTS/Intl lock
 ├── telemetry/
@@ -5241,6 +5728,22 @@ app/src/main/java/com/example/claudecageand/
 - **Карточный UI и просмотр версий компонентов (`ComponentVersions`).**
 - **Защита Recents (`FLAG_SECURE`):** предотвращение скриншотов и превью в диспетчере задач.
 
+### 4.6. W3C Web Notification API и Нативный Шлюз `ClaudeCageNotificationBridge.kt`
+- **Проблема WebView:** Chromium WebView в Android штатно не реализует спецификацию W3C Notifications API (`window.Notification` отсутствует, вызовы `requestPermission` блокируются).
+- **Полифилл Document-Start JS:**
+  - Полная реализация `window.Notification`: конструктор, `permission` (getter), `requestPermission(callback)`, `maxActions = 2`, `close()`.
+  - Все методы замаскированы через `cloak` (`[native code]`).
+  - Полифилл `ServiceWorkerRegistration.prototype.showNotification` и `getNotifications`.
+  - Перехват `navigator.permissions.query({ name: 'notifications' })`.
+- **Нативный Шлюз `ClaudeCageNotificationBridge`:**
+  - Проверка происхождения (`isOriginPermitted`): разрешены только `https://claude.ai`, `https://anthropic.com`, `https://claude.com` (с защитой от суффиксных атак).
+  - Управление каналом уведомлений: `NotificationChannel` с `IMPORTANCE_HIGH` (звук, вибрация, всплывающие Heads-Up баннеры).
+  - Раскрывающийся текст ответа: `NotificationCompat.BigTextStyle`.
+  - Динамическая иконка в зависимости от выбранного варианта в `AppIconManager`.
+  - Запрос рантайм-разрешения `POST_NOTIFICATIONS` на Android 13+ (API 33-37) при запуске и по требованию из JS.
+  - Обработка клика по уведомлению: `PendingIntent` открывает `MainActivity`, `onNewIntent` передаёт `window.__dispatchNotificationClick(id)`.
+- **Правило очистки логов:** файлы телеметрии из `logs_from_app/logs.txt` анализируются агентом и немедленно удаляются после обработки, сохраняя каталог в git (`.gitkeep`).
+
 ---
 
 ## 5. Команды Сборки, Тестирования и Верификации
@@ -5275,6 +5778,7 @@ app/src/main/java/com/example/claudecageand/
 | `SecurityAuditLoggerTest` | `app/src/test/.../telemetry/` | Кольцевой буфер, метрики, формат Markdown отчёта, thread-safety |
 | `UiStringsAndLanguageTest` | `app/src/test/.../ui/` | Полнота двуязычных строк (RU/EN), отсутствие пустых значений, версии |
 | `AppIconManagerTest` | `app/src/test/.../ui/` | Переключение лаунчер-алиасов |
+| `ClaudeCageNotificationBridgeTest` | `app/src/test/.../notifications/` | Проверка белого списка origin, валидация суффиксов, константы каналов |
 
 ---
 
@@ -5297,97 +5801,6 @@ app/src/main/java/com/example/claudecageand/
 4. **Безопасность криптографии AndroidKeyStore:** При шифровании AES-GCM не передавать собственный IV в `cipher.init(Cipher.ENCRYPT_MODE, key)`. Доверять генерацию случайного IV аппаратному провайдеру Keystore, считывать сгенерированный IV через `cipher.iv` и сохранять его с префиксом к шифротексту. Всегда связывать AAD с контекстом сущности (например, `profileId`).
 5. **Сохранение совместимости с JVM Unit Tests:** Классы, взаимодействующие с Android Keystore, ProfileStore или системными сервисами, обязаны иметь безопасный fallback/mock для прохождения тестов `./gradlew testDebugUnitTest` на хост-машине разработчика.
 6. **Не трогать dotfiles без инструкции:** В соответствии с пользовательскими правилами, любые изменения в dotfiles требуют предварительного создания ветки в git bare репозитории и бэкапа в `~/.config-backups/`.
-
-```
-
-### 5.15. `logs_from_app/logs.txt`
-**Назначение и роль в безопасности:** Исходный лог телеметрии и аудита безопасности, полученный напрямую с целевого смартфона Samsung Galaxy S25 Ultra
-
-```text
-# ClaudeCage Telemetry & Security Audit Report
-Generated at: 2026-10-26T18:11:13.077Z (Uptime: 710s)
-
-## 1. Device & OS Environment
-- Device: samsung SM-S938B (pa3q)
-- Android Version: Android 17 (API 37)
-- Target SDK: API 36, Min SDK: API 33
-- Active Tunnel State: Connected(network=326, interfaceName=tun1, tunIpv4=/100.72.12.97)
-- SOCKS5 Proxy Loopback Port: 127.0.0.1:37881
-
-## 2. Security Invariant Self-Checks
-| Security Invariant | Expected Value | Runtime Observed | Status |
-| :--- | :--- | :--- | :--- |
-| POSIX / JVM TimeZone | Europe/Amsterdam | POSIX: Europe/Amsterdam / JVM: Europe/Amsterdam | ✅ SECURE |
-| JVM Locale | en-US | en-US | ✅ SECURE |
-| ProxyController Lock | Active (127.0.0.1:<port>) | Active (No Fallback) | ✅ SECURE |
-| WebRTC / Document-Start JS | Active | Injected | ✅ SECURE |
-
-## 3. Network & Gatekeeper Telemetry Metrics
-| Metric | Value | Description |
-| :--- | :--- | :--- |
-| VPN Connect Count | 1 | Number of times active VPN tunnel was detected |
-| VPN Disconnect Count | 0 | Number of VPN drop / lost events |
-| Total SOCKS5 Requests | 28 | Total connection requests handled by proxy |
-| Successful Outbound Connects | 22 | Connections established through tun* source IP |
-| Blocked (VPN Off / Disconnected) | 0 | Connections refused because VPN was inactive |
-| Blocked IPv6 Requests | 0 | IPv6 (ATYP 0x04) requests rejected with 0x08 |
-| Force-Closed Sockets | 0 | Sockets terminated mid-stream on VPN drop |
-| Active Sockets in Pool | 6 | Currently open client / remote sockets |
-| DNS Queries Total | 23 | Raw DNS requests handled by TunnelDnsResolver |
-| DNS Cache Hits | 7 | Resolved from 60s in-memory cache |
-| DNS Network TCP Lookups | 16 | RFC 1035 TCP queries sent via tun* interface |
-| DNS Failures | 1 | Failed DNS queries |
-| DNS Latency (Last / Max) | 115ms / 54495ms | TCP DNS resolution response time |
-| Data Relayed (Sent / Recv) | 998.1 KB / 8.88 MB | Bytes relayed through SOCKS5 gatekeeper |
-
-## 4. Chronological Event Log (Recent 47 events)
-[2026-10-26T17:59:22.332Z][+14ms][VPN][INFO] VPN Connected: iface=tun1, tunIpv4=100.72.12.97, net=326
-[2026-10-26T17:59:22.342Z][+24ms][PROXY][INFO] SOCKS5 Proxy started on 127.0.0.1:37881
-[2026-10-26T17:59:22.343Z][+25ms][SECURITY][INFO] ClaudeCageApp initialized, Gatekeeper listening on 127.0.0.1:37881
-[2026-10-26T17:59:22.417Z][+99ms][SECURITY][INFO] MainActivity started with proxy on port 37881
-[2026-10-26T17:59:22.519Z][+201ms][SECURITY][INFO] ProxyController override confirmed on port 37881
-[2026-10-26T17:59:22.531Z][+213ms][SECURITY][INFO] Document-start JS hardening applied: true
-[2026-10-26T17:59:22.532Z][+214ms][SECURITY][INFO] User-Agent sanitized: Mozilla/5.0 (Linux; Android 17; SM-S938B Build/CP2A.260605.016) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.8059.43 Mobile Safari/537.36
-[2026-10-26T17:59:22.677Z][+359ms][DNS][INFO] DNS resolved 'claude.ai' via 1.1.1.1 in 112ms
-[2026-10-26T17:59:22.726Z][+408ms][PROXY][INFO] Established outbound TCP: /160.79.104.10:443 via tun1
-[2026-10-26T17:59:22.984Z][+666ms][DNS][INFO] DNS resolved 'assets-proxy.anthropic.com' via 1.1.1.1 in 99ms
-[2026-10-26T17:59:23.040Z][+722ms][PROXY][INFO] Established outbound TCP: /160.79.104.10:443 via tun1
-[2026-10-26T17:59:24.195Z][+1877ms][DNS][INFO] DNS resolved 's-cdn.anthropic.com' via 1.1.1.1 in 98ms
-[2026-10-26T17:59:24.275Z][+1957ms][PROXY][INFO] Established outbound TCP: /34.54.194.141:443 via tun1
-[2026-10-26T17:59:24.377Z][+2059ms][DNS][INFO] DNS resolved 'a.claude.ai' via 1.1.1.1 in 127ms
-[2026-10-26T17:59:24.427Z][+2109ms][PROXY][INFO] Established outbound TCP: /160.79.104.10:443 via tun1
-[2026-10-26T17:59:28.421Z][+6103ms][PROXY][INFO] Established outbound TCP: /160.79.104.10:443 via tun1
-[2026-10-26T17:59:29.143Z][+6825ms][DNS][INFO] DNS resolved 'widget.intercom.io' via 1.1.1.1 in 117ms
-[2026-10-26T17:59:29.194Z][+6876ms][PROXY][INFO] Established outbound TCP: /18.239.83.59:443 via tun1
-[2026-10-26T17:59:29.430Z][+7112ms][DNS][INFO] DNS resolved 'js.intercomcdn.com' via 1.1.1.1 in 119ms
-[2026-10-26T17:59:29.480Z][+7162ms][PROXY][INFO] Established outbound TCP: /18.239.105.107:443 via tun1
-[2026-10-26T17:59:29.882Z][+7564ms][DNS][INFO] DNS resolved 'api-iam.intercom.io' via 1.1.1.1 in 97ms
-[2026-10-26T17:59:30.039Z][+7721ms][PROXY][INFO] Established outbound TCP: /184.197.217.36:443 via tun1
-[2026-10-26T17:59:30.446Z][+8128ms][DNS][INFO] DNS resolved 'content-autofill.googleapis.com' via 1.1.1.1 in 100ms
-[2026-10-26T17:59:30.495Z][+8177ms][PROXY][INFO] Established outbound TCP: /172.217.112.4:443 via tun1
-[2026-10-26T17:59:30.652Z][+8334ms][DNS][INFO] DNS resolved 'nexus-websocket-a.intercom.io' via 1.1.1.1 in 97ms
-[2026-10-26T17:59:30.783Z][+8465ms][PROXY][INFO] Established outbound TCP: /18.97.36.57:443 via tun1
-[2026-10-26T17:59:32.113Z][+9795ms][PROXY][INFO] Established outbound TCP: /160.79.104.10:443 via tun1
-[2026-10-26T17:59:59.978Z][+37660ms][PROXY][INFO] Established outbound TCP: /184.197.217.36:443 via tun1
-[2026-10-26T18:06:01.984Z][+399666ms][DNS][WARN] Primary DNS failed for 'claude.ai', attempting fallback 8.8.8.8
-[2026-10-26T18:06:56.307Z][+453989ms][DNS][WARN] Primary DNS failed for 'nexus-websocket-a.intercom.io', attempting fallback 8.8.8.8
-[2026-10-26T18:06:56.310Z][+453992ms][DNS][ERROR] DNS resolution failed for 'claude.ai' on all servers
-[2026-10-26T18:06:56.441Z][+454123ms][DNS][INFO] DNS resolved 'nexus-websocket-a.intercom.io' via fallback 8.8.8.8 in 54495ms
-[2026-10-26T18:06:56.441Z][+454123ms][DNS][INFO] DNS resolved 'claude.ai' via 1.1.1.1 in 101ms
-[2026-10-26T18:06:56.512Z][+454194ms][PROXY][INFO] Established outbound TCP: /160.79.104.10:443 via tun1
-[2026-10-26T18:06:56.580Z][+454262ms][PROXY][INFO] Established outbound TCP: /18.97.36.56:443 via tun1
-[2026-10-26T18:07:01.736Z][+459418ms][PROXY][INFO] Established outbound TCP: /18.97.36.56:443 via tun1
-[2026-10-26T18:07:27.172Z][+484854ms][DNS][INFO] DNS resolved 'content-autofill.googleapis.com' via 1.1.1.1 in 99ms
-[2026-10-26T18:07:27.221Z][+484903ms][PROXY][INFO] Established outbound TCP: /172.217.114.4:443 via tun1
-[2026-10-26T18:10:29.083Z][+666765ms][DNS][INFO] DNS resolved 'claude.ai' via 1.1.1.1 in 1102ms
-[2026-10-26T18:10:29.134Z][+666816ms][PROXY][INFO] Established outbound TCP: /160.79.104.10:443 via tun1
-[2026-10-26T18:10:29.134Z][+666816ms][PROXY][INFO] Established outbound TCP: /160.79.104.10:443 via tun1
-[2026-10-26T18:10:29.134Z][+666816ms][PROXY][INFO] Established outbound TCP: /160.79.104.10:443 via tun1
-[2026-10-26T18:10:29.134Z][+666816ms][PROXY][INFO] Established outbound TCP: /160.79.104.10:443 via tun1
-[2026-10-26T18:10:30.733Z][+668415ms][DNS][INFO] DNS resolved 'nexus-websocket-a.intercom.io' via 1.1.1.1 in 108ms
-[2026-10-26T18:10:30.887Z][+668569ms][PROXY][INFO] Established outbound TCP: /18.97.36.62:443 via tun1
-[2026-10-26T18:10:37.670Z][+675352ms][DNS][INFO] DNS resolved 'assets-proxy.anthropic.com' via 1.1.1.1 in 115ms
-[2026-10-26T18:10:37.725Z][+675407ms][PROXY][INFO] Established outbound TCP: /160.79.104.10:443 via tun1
 
 ```
 
