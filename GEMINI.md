@@ -7,7 +7,7 @@
 ## 1. Общие Сведения о Проекте (Project Overview)
 
 - **Название приложения:** `ClaudeCage` (пакет: `com.example.claudecageand`).
-- **Текущая версия:** `1.1 (Build 2)` • **Hardening:** `Stage 10.1: Zero-Trust Hardening & Production Hotfix`.
+- **Текущая версия:** `1.2 (Build 3)` • **Hardening:** `Stage 10.1: Zero-Trust Hardening & Production Hotfix`.
 - **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36).
 - **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37).
 - **Целевой VPN-клиент:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray).
@@ -194,7 +194,7 @@ app/src/main/java/com/example/claudecageand/
 ./gradlew testDebugUnitTest assembleDebug
 ```
 
-- **Путь к собранному APK:** `ClaudeCage-1.1.apk` (автоматически сохраняется в корень проекта, а также дублируется в `app/build/outputs/apk/debug/ClaudeCage-1.1.apk`).
+- **Путь к собранному APK:** `ClaudeCage-1.2.apk` (автоматически сохраняется в корень проекта, а также дублируется в `app/build/outputs/apk/debug/ClaudeCage-1.2.apk`).
 - **HTML-отчёты о тестах:** `app/build/reports/tests/testDebugUnitTest/index.html`
 
 ---

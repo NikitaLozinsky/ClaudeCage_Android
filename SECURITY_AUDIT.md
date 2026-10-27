@@ -4,7 +4,7 @@
 **Целевая аудитория аудита:** Gemini Argon 4 (Frontier Reasoning & Security Architecture Model)  
 **Дата актуализации:** 27 октября 2026 г.  
 **Проект:** `ClaudeCage` (пакет: `com.example.claudecageand`)  
-**Текущая версия:** `1.1 (Build 2)` • **Уровень харденинга:** `Stage 10: Zero-Trust Hardening & Code Review Remediation`  
+**Текущая версия:** `1.2 (Build 3)` • **Уровень харденинга:** `Stage 10.1: Zero-Trust Hardening & Production Hotfix`  
 **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36)  
 **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37)  
 **Целевой сетевой туннель:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray)  
@@ -3459,7 +3459,7 @@ class MainActivity : AppCompatActivity() {
         return ComponentVersions(
             appVersionName = verName,
             appVersionCode = verCode,
-            stageHardening = "Stage 10: Zero-Trust Hardening & Code Review Remediation",
+            stageHardening = "Stage 10.1: Zero-Trust Hardening & Production Hotfix",
             androidRelease = Build.VERSION.RELEASE,
             apiLevel = Build.VERSION.SDK_INT,
             securityPatch = patch,
@@ -4337,7 +4337,7 @@ class SecurityAuditLogger(context: Context) {
         sb.appendLine()
 
         sb.appendLine("## 1. Device & OS Environment")
-        sb.appendLine("- **App & Hardening:** `ClaudeCage v1.1 (Build 2) • Stage 10: Zero-Trust Hardening & Code Review Remediation`")
+        sb.appendLine("- **App & Hardening:** `ClaudeCage v1.2 (Build 3) • Stage 10.1: Zero-Trust Hardening & Production Hotfix`")
         sb.appendLine("- **Device:** `${Build.MANUFACTURER} ${Build.MODEL} (${Build.DEVICE})`")
         sb.appendLine("- **Android Version:** `Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})`")
         sb.appendLine("- **Target SDK:** `API 36`, **Min SDK:** `API 33`")
@@ -4901,7 +4901,7 @@ data class AccountProfile(
 ```
 
 ### 5.12. `app/build.gradle.kts`
-**Назначение и роль в безопасности:** Конфигурация сборки Gradle: зависимости, SDK targets (Min 33, Target 36), скрипт копирования APK ClaudeCage-1.1.apk
+**Назначение и роль в безопасности:** Конфигурация сборки Gradle: зависимости, SDK targets (Min 33, Target 36), скрипт копирования APK ClaudeCage-1.2.apk
 
 ```kotlin
 plugins {
@@ -4920,8 +4920,8 @@ android {
         applicationId = "com.example.claudecageand"
         minSdk = 33
         targetSdk = 36
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -4948,7 +4948,7 @@ tasks.register("copyApkToRoot") {
         val debugApkDir = File(buildDir, "outputs/apk/debug")
         val apkFile = debugApkDir.listFiles()?.firstOrNull { it.extension == "apk" && !it.name.contains("unaligned") }
         if (apkFile != null) {
-            val ver = android.defaultConfig.versionName ?: "1.1"
+            val ver = android.defaultConfig.versionName ?: "1.2"
             val targetName = "ClaudeCage-$ver.apk"
             val destInRoot = File(rootDir, targetName)
 
@@ -5071,7 +5071,7 @@ dependencies {
 ## 1. Общие Сведения о Проекте (Project Overview)
 
 - **Название приложения:** `ClaudeCage` (пакет: `com.example.claudecageand`).
-- **Текущая версия:** `1.1 (Build 2)` • **Hardening:** `Stage 10.1: Zero-Trust Hardening & Production Hotfix`.
+- **Текущая версия:** `1.2 (Build 3)` • **Hardening:** `Stage 10.1: Zero-Trust Hardening & Production Hotfix`.
 - **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36).
 - **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37).
 - **Целевой VPN-клиент:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray).
@@ -5258,7 +5258,7 @@ app/src/main/java/com/example/claudecageand/
 ./gradlew testDebugUnitTest assembleDebug
 ```
 
-- **Путь к собранному APK:** `ClaudeCage-1.1.apk` (автоматически сохраняется в корень проекта, а также дублируется в `app/build/outputs/apk/debug/ClaudeCage-1.1.apk`).
+- **Путь к собранному APK:** `ClaudeCage-1.2.apk` (автоматически сохраняется в корень проекта, а также дублируется в `app/build/outputs/apk/debug/ClaudeCage-1.2.apk`).
 - **HTML-отчёты о тестах:** `app/build/reports/tests/testDebugUnitTest/index.html`
 
 ---
@@ -5405,7 +5405,7 @@ Generated at: 2026-10-26T18:11:13.077Z (Uptime: 710s)
      - `AccountProfileManagerTest`, `SecurityAuditLoggerTest`, `AppIconManagerTest`, `UiStringsAndLanguageTest`, `VpnTunnelStateTest`.
 2. **Сборка Production APK (`./gradlew assembleDebug`):**
    - **Результат:** `BUILD SUCCESSFUL in 4s`
-   - **Собранный файл:** `ClaudeCage-1.1.apk` в корне проекта (`12 905 541 байт`). Устаревший бинарник `1.0` автоматически удалён скриптом сборки.
+   - **Собранный файл:** `ClaudeCage-1.2.apk` в корне проекта (`12 905 541 байт`). Устаревший бинарник `1.1` автоматически удалён скриптом сборки.
 
 ---
 

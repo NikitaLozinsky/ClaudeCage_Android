@@ -14,8 +14,8 @@ android {
         applicationId = "com.example.claudecageand"
         minSdk = 33
         targetSdk = 36
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -42,7 +42,7 @@ tasks.register("copyApkToRoot") {
         val debugApkDir = File(buildDir, "outputs/apk/debug")
         val apkFile = debugApkDir.listFiles()?.firstOrNull { it.extension == "apk" && !it.name.contains("unaligned") }
         if (apkFile != null) {
-            val ver = android.defaultConfig.versionName ?: "1.1"
+            val ver = android.defaultConfig.versionName ?: "1.2"
             val targetName = "ClaudeCage-$ver.apk"
             val destInRoot = File(rootDir, targetName)
 
