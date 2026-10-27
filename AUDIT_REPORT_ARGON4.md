@@ -4,7 +4,7 @@
 **Целевая аудитория аудита:** Gemini Argon 4 (Frontier Reasoning & Security Architecture Model)  
 **Дата актуализации:** 27 октября 2026 г.  
 **Проект:** `ClaudeCage` (пакет: `com.example.claudecageand`)  
-**Текущая версия:** `1.2 (Build 3)` • **Уровень харденинга:** `Stage 10.1: Zero-Trust Hardening & Production Hotfix`  
+**Текущая версия:** `1.2 (Build 3)` • **Уровень харденинга:** `Stage 10.2: Zero-Trust Hardening & Production Hotfix (JavaBridge Threading, Smart WakeLock, Fallback Cookie Purge)`  
 **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36)  
 **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37)  
 **Целевой сетевой туннель:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray)  
@@ -166,10 +166,10 @@
   2. Вызов `WebSettingsCompat.setSafeBrowsingEnabled(settings, false)` гарантирует отключение фоновых запросов Chromium к телеметрии Google.
   3. Полный запрет fallback: `isDirectFallbackDisallowed = true`.
 
-### 3.11. Отказоустойчивость Рендерера и Безопасный JS-Мост Загрузок
+### 3.11. Отказоустойчивость Рендерера и Потокобезопасный JS-Мост (JavaBridge Safety)
 - **Архитектурное решение (`MainActivity.kt`):**
   1. **Восстановление после падения Chromium (`onRenderProcessGone`):** при нехватке памяти или сбое движка Activity не завершается аварийно, а безопасно пересоздаёт экземпляр WebView и восстанавливает сессию.
-  2. **Origin Validation в `SafeDownloadBridge`:** JS-мост загрузки файлов строго проверяет домен вызывающего фрейма (`wv.url?.startsWith("https://claude.ai") == true`), защищая хранилище устройства от вредоносных iframe.
+  2. **Потокобезопасная Origin Validation без обращения к WebView из JavaBridge:** вызовы методов `@JavascriptInterface` выполняются Chromium на выделенном фоновом потоке `JavaBridge`. Прямое чтение `webView.url` в этом потоке приводит к `RuntimeException: A WebView method was called on thread 'JavaBridge'`. В Stage 10.2 внедрён `@Volatile currentWebViewUrl: String?`, синхронизируемый на UI-потоке через коллбэки `onPageStarted`, `onPageFinished`, `doUpdateVisitedHistory` и методы загрузки. Мосты `SafeDownloadBridge` и `ClaudeCageNotificationBridge` получают лямбду `{ currentWebViewUrl }`, что исключает краши и гонки, а критические операции повторно верифицируют origin внутри `runOnUiThread`.
 
 ### 3.12. Реализация W3C Web Notification API и Нативного Шлюза
 - **Проблема платформы Android:** Стандартный движок Chromium WebView в Android **не реализует** спецификацию W3C Web Notifications API (`window.Notification` попросту отсутствует в глобальной области видимости, либо вызовы `Notification.requestPermission()` молча отклоняются). Кроме того, Android 13+ (API 33–37) требует обязательного манифестного и рантайм-разрешения `POST_NOTIFICATIONS`. Из-за этого пользователь не получал оповещений, когда Claude заканчивал генерацию ответа в фоне.
@@ -184,26 +184,33 @@
      - Все внедрённые функции зарегистрированы в `WeakMap` и замаскированы под нативный движок Chromium (`[native code]`).
   2. **Нативный Шлюз `ClaudeCageNotificationBridge`:**
      - **Zero-Trust Origin Check (`isOriginPermitted`):** строгая проверка вызывающего фрейма (разрешены только `https://claude.ai`, `https://anthropic.com`, `https://claude.com` с блокировкой суффиксных атак вроде `claude.ai.attacker.com`).
+     - **Рантайм-разрешения (Android 13+):** интеграция с системным лаунчером `POST_NOTIFICATIONS` и сохранением очереди ожидающих Promise по `reqId`.
      - **Канал уведомлений (`NotificationChannel`):** канал `claude_cage_notifications` с важностью `IMPORTANCE_HIGH` (Heads-Up всплывающие баннеры, звук и вибрация).
      - **Раскрывающийся текст ответа (`NotificationCompat.BigTextStyle`):** превью ответа Claude можно читать прямо в системной шторке.
      - **Динамическая иконка:** автоматическое использование текущего варианта иконки из `AppIconManager`.
      - **Двусторонняя маршрутизация клика:** клик по уведомлению открывает `MainActivity`, а метод `onNewIntent` доставляет событие в WebView через `window.__dispatchNotificationClick(id)`, активируя пользовательский обработчик `onclick` на стороне Claude.
 
-### 3.13. Защита Фонового Выполнения при Генерации Ответов (Background Streaming & WakeLock)
+### 3.13. Защита Фонового Выполнения и Умный WakeLock (`hasRecentTraffic`)
 - **Проблема агрессивного энергосбережения Android (Samsung One UI 9 / Android 17):**
   Когда пользователь отправляет большой запрос и сворачивает приложение (переключается в другое приложение или выходит на рабочий стол), ОС переводит процесс в статус `CACHED` и через 10–30 секунд активирует kernel cgroup freezer, либо отключает процессор при погасшем экране. Потоки SOCKS5-релея замораживаются, сокет входящего SSE-потока Claude отсекается по таймауту, и уведомление так и не приходит.
-- **Архитектурное решение (`MainActivity.kt`, `AndroidManifest.xml`):**
+- **Проблема ложных срабатываний idle-сокетов:**
+  Chromium и OkHttp удерживают неактивные HTTP/2 и WebSocket соединения Intercom в пуле до 5 минут (`STREAMING_TIMEOUT_MS = 300_000`). Простая проверка `activeSocketCount > 0` приводила к захвату 3-минутного WakeLock при каждом сворачивании даже в состоянии полного покоя.
+- **Архитектурное решение Stage 10.2 (`VpnGatekeeperProxy.kt`, `MainActivity.kt`, `AndroidManifest.xml`):**
   1. Добавлено системное разрешение `android.permission.WAKE_LOCK`.
-  2. Интеграция с монитором сокетов шлюза: `app.vpnGatekeeperProxy.activeSocketCount`.
-  3. В методе `onStop()`: если на момент сворачивания зафиксированы активные SOCKS5-соединения (`activeSocketCount > 0`), Activity захватывает легковесный `PARTIAL_WAKE_LOCK` с гарантированным защитным таймаутом (максимум 3 минуты).
-  4. Процессор остаётся активным, сокеты в `tun0` не разрываются, SSE-токены беспрепятственно поступают в WebView.
-  5. **Немедленное освобождение:** как только Claude завершает ответ и шлюз вызывает `showNotification`, WakeLock немедленно отпускается. Также он снимается в `onResume()` при возвращении пользователя. Расход батареи сведён к абсолютному нулю.
+  2. **Интеллектуальный трекинг трафика:** переменная `@Volatile var lastTrafficTimestampMillis: Long = 0L` обновляется внутри релейного цикла `pipe()` при каждой фактической передаче сетевых байтов (`bytesRead > 0`).
+  3. **Предикат активности:** метод `fun hasRecentTraffic(windowMs: Long = 15_000L): Boolean` возвращает `true` только если в пуле есть открытые сокеты **И** через них проходили данные за последние 15 секунд.
+  4. В методе `onStop()`: `PARTIAL_WAKE_LOCK` захватывается **только** при `hasRecentTraffic(15_000L) == true`. Если Claude просто ожидает ввода пользователя — устройство спит без расхода батареи.
+  5. При активной генерации процессор остаётся активным, сокеты в `tun0` не разрываются, SSE-токены беспрепятственно поступают в WebView, и при финише генерируется системное уведомление.
+  6. **Немедленное освобождение:** WakeLock автоматически снимается в `onResume()` при возвращении пользователя в приложение или по истечении 3-минутного защитного таймаута.
 
 ### 3.14. Архитектурный Анализ и Реализованные Инновации UX / Надежности
 - **Быстрая перезагрузка страницы (`btnReload`):**
   В верхнюю панель статуса добавлена кнопка `🔄`. При залипании интерфейса Claude или сбоях скриптов пользователь может обновить страницу в один клик. При переподключении VPN туннель также прозрачно шлёт событие `online`.
-- **Экстренный сброс кэша и сессии профиля (`promptPurgeProfileSession`):**
-  В меню профилей добавлена кнопка «🧹 Очистить кэш и сессию». При зацикливании капчи Turnstile или повреждении локального хранилища она точечно очищает `CookieManager`, `WebStorage` и кэш WebView конкретного профиля без необходимости удалять и пересоздавать профиль.
+- **Комплексный сброс кэша и сессии профиля (`promptPurgeProfileSession`):**
+  В меню профилей добавлена кнопка «🧹 Очистить кэш и сессию». При зацикливании капчи Turnstile или сбое авторизации она точечно очищает:
+  1. `p.cookieManager.removeAllCookies(null)` и `p.webStorage.deleteAllData()` для активного `ProfileStore`.
+  2. Резервный аппаратный Cookie Jar: `app.accountProfileManager.fallback.deleteCookies(profile.id)`, гарантируя стирание AES-GCM зашифрованных cookie из Keystore.
+  3. Кэш WebView (`webView?.clearCache(true)`) и перезагружает `https://claude.ai`.
 - **Анализ модификации списка доменов (Domain Whitelist Governance):**
   Проведён детальный аудит идеи редактирования белого списка доменов:
   - *Вывод:* Полная замена или произвольное редактирование базового списка **недопустимы**, так как удаление системных доменов (Cloudflare Turnstile, Statsig, Intercom) вызовет скрытый отказ веб-приложения, а добавление широких масок нарушит инвариант Zero-Leak.
@@ -211,9 +218,9 @@
 
 ---
 
-## 4. Сравнительная Таблица Харденинга (Stage 8 vs Stage 9 vs Stage 10.1)
+## 4. Сравнительная Таблица Харденинга (Stage 8 vs Stage 9 vs Stage 10.2)
 
-| Вектор Угрозы / Компонент | Stage 8 (Базовая версия) | Stage 9 (Production) | Stage 10.1 (Zero-Trust + Notifications) |
+| Вектор Угрозы / Компонент | Stage 8 (Базовая версия) | Stage 9 (Production) | Stage 10.2 (Zero-Trust + W3C + JavaBridge Safe) |
 | :--- | :--- | :--- | :--- |
 | **SOCKS5 Порт 127.0.0.1** | Открыт всем приложениям | Открыт всем приложениям | **Destination Allowlist (24 домена) + Private IP Filter** |
 | **Пул Потоков Релея** | `Dispatchers.IO` (голодание) | `Dispatchers.IO` (голодание) | **Выделенный `relayExecutor` (Cached Thread Pool)** |
@@ -230,8 +237,9 @@
 | **Proxy Bypass Loopback** | Неявные правила активны | Неявные правила активны | **`.removeImplicitRules()` (Anti-Bypass)** |
 | **Краш Рендерера** | Падение приложения | Падение приложения | **`onRenderProcessGone` авто-восстановление** |
 | **Web Notifications API** | Отсутствовали (WebView block)| Отсутствовали | **W3C Polyfill + Heads-Up Bridge + Runtime Perms** |
-| **Фон при генерации** | Заморозка cgroup freezer | Заморозка / разрыв SSE | **Умный `PARTIAL_WAKE_LOCK` по activeSocketCount** |
-| **Управление сессией** | Только удаление профиля | Только удаление профиля | **Точечный сброс кук/кэша + кнопка Reload (🔄)** |
+| **JS-Bridge Thread Safety**| Crash на non-UI thread | Crash на non-UI thread | **Volatile URL cache + UI-thread double check (JavaBridge safe)** |
+| **Фон при генерации** | Заморозка cgroup freezer | Заморозка / разрыв SSE | **Smart `PARTIAL_WAKE_LOCK` (только при трафике < 15с)** |
+| **Управление сессией** | Только удаление профиля | Только удаление профиля | **Комплексный сброс: ProfileStore + Fallback Jar + 🔄 Reload** |
 
 ---
 
@@ -946,6 +954,18 @@ class VpnGatekeeperProxy(
     private val outboundSockets = ConcurrentHashMap<Socket, Long>()
     private val isRunning = AtomicBoolean(false)
 
+    @Volatile
+    var lastTrafficTimestampMillis: Long = 0L
+
+    /**
+     * Checks whether active streaming traffic has passed through the SOCKS5 proxy within [windowMs].
+     * Prevents false-positive WakeLock triggers when Chromium keeps idle HTTP/2 or Intercom WebSocket
+     * connections alive in the background pool.
+     */
+    fun hasRecentTraffic(windowMs: Long = 15_000L): Boolean {
+        return activeSockets.isNotEmpty() && (System.currentTimeMillis() - lastTrafficTimestampMillis) < windowMs
+    }
+
     // Synchronous tunnel listener for instant kill-switch and handover tracking
     private val tunnelListener = TunnelListener { _, current ->
         when (current) {
@@ -1399,6 +1419,7 @@ class VpnGatekeeperProxy(
                 if (bytesRead == -1) break
                 output.write(buffer, 0, bytesRead)
                 output.flush()
+                lastTrafficTimestampMillis = System.currentTimeMillis()
                 onBytes(bytesRead.toLong())
             }
         } catch (_: SocketException) {
@@ -1978,6 +1999,7 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.URLUtil
@@ -2070,6 +2092,9 @@ class MainActivity : AppCompatActivity() {
 
     private var isTopBarCollapsed: Boolean = false
     private var backgroundWakeLock: PowerManager.WakeLock? = null
+
+    @Volatile
+    private var currentWebViewUrl: String? = CLAUDE_URL
 
     private var webView: WebView? = null
     private var isProxyOverrideActive = false
@@ -2323,6 +2348,7 @@ class MainActivity : AppCompatActivity() {
         btnReturnToClaude.setOnClickListener {
             it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
             btnReturnToClaude.visibility = View.GONE
+            currentWebViewUrl = CLAUDE_URL
             webView?.loadUrl(CLAUDE_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
         }
         btnAccountSwitcher.setOnClickListener {
@@ -2491,8 +2517,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
-        val active = app.vpnGatekeeperProxy.activeSocketCount
-        if (active > 0) {
+        if (app.vpnGatekeeperProxy.hasRecentTraffic(15_000L)) {
             acquireBackgroundWakeLock()
         }
     }
@@ -2676,13 +2701,24 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
 
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                currentWebViewUrl = url ?: CLAUDE_URL
+            }
+
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
+                currentWebViewUrl = url ?: CLAUDE_URL
                 if (url?.contains("browserleaks.com") == true) {
                     btnReturnToClaude.visibility = View.VISIBLE
                 } else if (url?.contains("claude.ai") == true) {
                     btnReturnToClaude.visibility = View.GONE
                 }
+            }
+
+            override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                super.doUpdateVisitedHistory(view, url, isReload)
+                currentWebViewUrl = url ?: CLAUDE_URL
             }
         }
 
@@ -2719,9 +2755,15 @@ class MainActivity : AppCompatActivity() {
         // Wire SafeDownloadBridge with origin verification
         wv.addJavascriptInterface(
             SafeDownloadBridge(
-                getActiveUrl = { wv.url },
+                getActiveUrl = { currentWebViewUrl },
                 onDownloaded = { bytes, filename, _ ->
                     runOnUiThread {
+                        val activeUrl = currentWebViewUrl ?: webView?.url ?: ""
+                        if (!activeUrl.startsWith("https://claude.ai/") && activeUrl != "https://claude.ai") {
+                            val lang = app.uiLanguageManager.language.value
+                            Toast.makeText(this, UiStrings.toastDownloadFailed(lang, "unauthorized origin ($activeUrl)"), Toast.LENGTH_SHORT).show()
+                            return@runOnUiThread
+                        }
                         pendingDownloadBytes = bytes
                         pendingDownloadFilename = filename.ifBlank { "claude_artifact.txt" }
                         createDocumentLauncher.launch(pendingDownloadFilename)
@@ -2740,7 +2782,7 @@ class MainActivity : AppCompatActivity() {
         // Wire W3C Web Notification Bridge
         val notifBridge = ClaudeCageNotificationBridge(
             activity = this,
-            getActiveUrl = { wv.url },
+            getActiveUrl = { currentWebViewUrl },
             webViewProvider = { webView },
             onRequestPermission = { reqId ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -2789,6 +2831,7 @@ class MainActivity : AppCompatActivity() {
         if (initialVpnState is VpnTunnelState.Connected) {
             wv.setNetworkAvailable(true)
             waitingOverlay.visibility = View.GONE
+            currentWebViewUrl = CLAUDE_URL
             wv.loadUrl(CLAUDE_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
             hasLoadedInitialUrl = true
         } else {
@@ -3123,6 +3166,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun purgeProfileSession(profile: AccountProfile) {
         try {
+            app.accountProfileManager.fallback.deleteCookies(profile.id)
             if (WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)) {
                 val profileStore = ProfileStore.getInstance()
                 val p = profileStore.getOrCreateProfile(profile.storageKey)
@@ -3133,6 +3177,7 @@ class MainActivity : AppCompatActivity() {
                 android.webkit.WebStorage.getInstance().deleteAllData()
             }
             webView?.clearCache(true)
+            currentWebViewUrl = CLAUDE_URL
             webView?.loadUrl(CLAUDE_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
             app.auditLogger.logInfo("Accounts", "Purged session and cache for profile: ${profile.displayName}")
         } catch (e: Exception) {
@@ -3160,6 +3205,7 @@ class MainActivity : AppCompatActivity() {
 
                     if (!hasLoadedInitialUrl) {
                         waitingOverlay.visibility = View.GONE
+                        currentWebViewUrl = CLAUDE_URL
                         wv.loadUrl(CLAUDE_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
                         hasLoadedInitialUrl = true
                     }
@@ -3515,6 +3561,7 @@ class MainActivity : AppCompatActivity() {
         val btnLeaks = createActionButton(UiStrings.btnBrowserLeaks(lang)) {
             dialogRef?.dismiss()
             btnReturnToClaude.visibility = View.VISIBLE
+            currentWebViewUrl = DIAGNOSTIC_URL
             webView?.loadUrl(DIAGNOSTIC_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
         }
         val btnClear = createActionButton(UiStrings.btnClearLogs(lang)) {
@@ -4573,6 +4620,12 @@ class ClaudeCageNotificationBridge(
             return
         }
         activity.runOnUiThread {
+            val verifiedUrl = getActiveUrl() ?: webViewProvider()?.url
+            if (!isOriginPermitted(verifiedUrl)) {
+                auditLogger.logWarning("Notification", "Blocked permission request from unauthorized origin on UI thread: $verifiedUrl")
+                resolveJsPermission(reqId, "denied")
+                return@runOnUiThread
+            }
             if (hasNotificationPermission()) {
                 resolveJsPermission(reqId, "granted")
             } else {
@@ -4597,6 +4650,12 @@ class ClaudeCageNotificationBridge(
         }
 
         activity.runOnUiThread {
+            val verifiedUrl = getActiveUrl() ?: webViewProvider()?.url
+            if (!isOriginPermitted(verifiedUrl)) {
+                auditLogger.logWarning("Notification", "Blocked notification from unauthorized origin on UI thread: $verifiedUrl")
+                return@runOnUiThread
+            }
+
             if (!hasNotificationPermission()) {
                 auditLogger.logWarning("Notification", "Cannot display notification $notifId: permission not granted")
                 return@runOnUiThread
@@ -5701,7 +5760,7 @@ dependencies {
 ## 1. Общие Сведения о Проекте (Project Overview)
 
 - **Название приложения:** `ClaudeCage` (пакет: `com.example.claudecageand`).
-- **Текущая версия:** `1.2 (Build 3)` • **Hardening:** `Stage 10.1: Zero-Trust Hardening & Production Hotfix`.
+- **Текущая версия:** `1.2 (Build 3)` • **Hardening:** `Stage 10.2: Zero-Trust Hardening & Production Hotfix (JavaBridge Threading, Smart WakeLock, Fallback Cookie Purge)`.
 - **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36).
 - **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37).
 - **Целевой VPN-клиент:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray).
@@ -5768,9 +5827,14 @@ dependencies {
    - **`Function.prototype.toString` Cloaking:** регистрация `Function.prototype.toString` в `WeakMap` гарантирует, что `Function.prototype.toString.toString()` возвращает `function toString() { [native code] }`. Все переопределённые методы `Date` и `Intl` замаскированы под нативные.
    - Блокировка TTS-голосов на уровне `window.speechSynthesis` и `SpeechSynthesis.prototype.getVoices`.
    - Фиксация `Intl.*` на `en-US`, `hardwareConcurrency = 8`, `deviceMemory = 8`, `navigator.webdriver = false`, `navigator.connection.onchange = null`.
-10. **Отказоустойчивость WebView и валидация Origin:**
+10. **Отказоустойчивость WebView и потокобезопасная валидация Origin:**
     - Реализован `onRenderProcessGone` в `WebViewClient`: при сбое или нехватке памяти рендерера Chromium Activity не падает, а безопасно пересоздаёт WebView.
-    - В `SafeDownloadBridge` встроена строгая валидация источника (`url.startsWith("https://claude.ai")`), предотвращающая междоменный вызов загрузчика.
+    - В `SafeDownloadBridge` и `ClaudeCageNotificationBridge` встроена строгая валидация источника. Для исключения `RuntimeException: A WebView method was called on thread 'JavaBridge'` URL страницы кэшируется в `@Volatile currentWebViewUrl` в UI-коллбэках (`onPageStarted`, `onPageFinished`, `doUpdateVisitedHistory`), а доступ к методам экземпляра WebView выполняется строго внутри `runOnUiThread`.
+11. **W3C Web Notifications API, Smart WakeLock и управление сессией:**
+    - Document-Start JS реализует полный W3C polyfill для `window.Notification` и `ServiceWorkerRegistration.prototype.showNotification`, замаскированный через WeakMap (`[native code]`).
+    - Нативный шлюз `ClaudeCageNotificationBridge` фильтрует origin, выводит Heads-Up уведомления (`IMPORTANCE_HIGH`) с `BigTextStyle` и пробрасывает клики в чат (`window.__dispatchNotificationClick`).
+    - **Smart `PARTIAL_WAKE_LOCK`:** в `MainActivity.onStop()` WakeLock захватывается исключительно при наличии свежего сетевого трафика через прокси за последние 15 секунд (`hasRecentTraffic(15_000L)` на базе отслеживания байтов в `pipe()`), что устраняет ложные срабатывания и разрядку батареи из-за неактивных keep-alive пулов Chromium.
+    - **Комплексный сброс сессии (`purgeProfileSession`):** точечно очищает `ProfileStore`, кэш рендерера и аппаратный Keystore Fallback Cookie Jar (`deleteCookies(profile.id)`), а в статус-бар вынесена кнопка быстрой перезагрузки страницы `btnReload` (`🔄`).
 
 ---
 
@@ -5916,7 +5980,7 @@ app/src/main/java/com/example/claudecageand/
 | Тестовый класс | Расположение | Проверяемый функционал |
 | :--- | :--- | :--- |
 | `TunnelDnsResolverTest` | `app/src/test/.../net/` | Watchdog таймауты, `staleCache` fallback, кэширование, canary NODATA, TCP DNS |
-| `VpnGatekeeperProxyTest` | `app/src/test/.../net/` | Блокировка при VPN Off, разрыв сокетов, блокировка IPv6 (0x08), блокировка доменов СНГ (.ru/.by/.su), Network binding |
+| `VpnGatekeeperProxyTest` | `app/src/test/.../net/` | Блокировка при VPN Off, разрыв сокетов, блокировка IPv6 (0x08), блокировка доменов СНГ (.ru/.by/.su), Network binding, проверка активности трафика `hasRecentTraffic` |
 | `VpnTunnelStateTest` | `app/src/test/.../net/` | Модели состояний туннеля, равенство и форматирование |
 | `AntiFingerprintHardenerTest` | `app/src/test/.../security/` | Canvas шум для seed 0, `toBlob`, `speechSynthesis`, `Intl` en-US, `webdriver` |
 | `AccountProfileManagerTest` | `app/src/test/.../accounts/` | Создание, переименование, удаление, переключение профилей, seed |
@@ -5945,7 +6009,8 @@ app/src/main/java/com/example/claudecageand/
 3. **Блокирующие системные вызовы сокетов и пулы потоков:** Никогда не полагаться только на `withTimeoutOrNull` для прерывания вызовов вроде `Socket.connect()` или `InputStream.read()`. Для DNS-запросов обязательно использовать выделенный `ScheduledExecutorService` watchdog, не зависящий от корутинного пула. Длительный двунаправленный ретрансляционный I/O сокетов (`pipe`) выносить исключительно в отдельный пул потоков (`relayExecutor`), не занимая ограниченный `Dispatchers.IO` (лимит 64 потока).
 4. **Безопасность криптографии AndroidKeyStore:** При шифровании AES-GCM не передавать собственный IV в `cipher.init(Cipher.ENCRYPT_MODE, key)`. Доверять генерацию случайного IV аппаратному провайдеру Keystore, считывать сгенерированный IV через `cipher.iv` и сохранять его с префиксом к шифротексту. Всегда связывать AAD с контекстом сущности (например, `profileId`).
 5. **Сохранение совместимости с JVM Unit Tests:** Классы, взаимодействующие с Android Keystore, ProfileStore или системными сервисами, обязаны иметь безопасный fallback/mock для прохождения тестов `./gradlew testDebugUnitTest` на хост-машине разработчика.
-6. **Не трогать dotfiles без инструкции:** В соответствии с пользовательскими правилами, любые изменения в dotfiles требуют предварительного создания ветки в git bare репозитории и бэкапа в `~/.config-backups/`.
+6. **Потокобезопасность JS-интерфейсов Chromium (`@JavascriptInterface`):** Методы, аннотированные `@JavascriptInterface`, выполняются Chromium на выделенном потоке `JavaBridge`. Прямое обращение к `WebView` (например, `webView.url`) из этих методов приводит к `RuntimeException`. Для валидации Origin использовать потокобезопасные кэшированные переменные (`@Volatile currentWebViewUrl`), обновляемые в UI-коллбэках `WebViewClient`, а доступ к экземпляру WebView осуществлять строго внутри `activity.runOnUiThread { ... }`.
+7. **Не трогать dotfiles без инструкции:** В соответствии с пользовательскими правилами, любые изменения в dotfiles требуют предварительного создания ветки в git bare репозитории и бэкапа в `~/.config-backups/`.
 
 ```
 
@@ -5985,8 +6050,8 @@ app/src/main/java/com/example/claudecageand/
    - Полностью ли исключена возможность атаки повторного использования IV (IV reuse) при использовании провайдера `AndroidKeyStore` без передачи клиентского параметра спецификации?
    - Является ли привязка идентификатора профиля через AAD (`cipher.updateAAD(profileId)`) исчерпывающей для предотвращения перестановки сессий?
 5. **Безопасность W3C Notification Bridge и Фоновое Выполнение:**
-   - Полностью ли Zero-Trust Origin Validation в `ClaudeCageNotificationBridge` исключает несанкционированную отправку уведомлений со сторонних или вложенных iframe?
-   - Насколько безопасна связка `PARTIAL_WAKE_LOCK` со счётчиком `activeSocketCount > 0` и жестким тайм-аутом 3 минуты: гарантирует ли она полную защиту от утечек энергии аккумулятора и зависания процессов в спящем режиме Android Doze?
+   - Полностью ли двухфакторная проверка Origin (через `@Volatile currentWebViewUrl` в потоке JavaBridge и вторично через `webViewProvider()?.url` на UI-потоке) исключает несанкционированную отправку уведомлений со сторонних или вложенных iframe?
+   - Обеспечивает ли предикат `hasRecentTraffic(15_000L)` в связке с `PARTIAL_WAKE_LOCK` оптимальный баланс между гарантией доставки фоновых ответов и полной защитой от утечек энергии аккумулятора в режиме ожидания?
 
 ---
 *Отчёт сформирован для глубокого архитектурного аудита безопасности моделью Gemini Argon 4.*

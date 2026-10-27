@@ -7,7 +7,7 @@
 ## 1. Общие Сведения о Проекте (Project Overview)
 
 - **Название приложения:** `ClaudeCage` (пакет: `com.example.claudecageand`).
-- **Текущая версия:** `1.2 (Build 3)` • **Hardening:** `Stage 10.1: Zero-Trust Hardening & Production Hotfix`.
+- **Текущая версия:** `1.2 (Build 3)` • **Hardening:** `Stage 10.2: Zero-Trust Hardening & Production Hotfix (JavaBridge Threading, Smart WakeLock, Fallback Cookie Purge)`.
 - **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36).
 - **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37).
 - **Целевой VPN-клиент:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray).
@@ -74,9 +74,14 @@
    - **`Function.prototype.toString` Cloaking:** регистрация `Function.prototype.toString` в `WeakMap` гарантирует, что `Function.prototype.toString.toString()` возвращает `function toString() { [native code] }`. Все переопределённые методы `Date` и `Intl` замаскированы под нативные.
    - Блокировка TTS-голосов на уровне `window.speechSynthesis` и `SpeechSynthesis.prototype.getVoices`.
    - Фиксация `Intl.*` на `en-US`, `hardwareConcurrency = 8`, `deviceMemory = 8`, `navigator.webdriver = false`, `navigator.connection.onchange = null`.
-10. **Отказоустойчивость WebView и валидация Origin:**
+10. **Отказоустойчивость WebView и потокобезопасная валидация Origin:**
     - Реализован `onRenderProcessGone` в `WebViewClient`: при сбое или нехватке памяти рендерера Chromium Activity не падает, а безопасно пересоздаёт WebView.
-    - В `SafeDownloadBridge` встроена строгая валидация источника (`url.startsWith("https://claude.ai")`), предотвращающая междоменный вызов загрузчика.
+    - В `SafeDownloadBridge` и `ClaudeCageNotificationBridge` встроена строгая валидация источника. Для исключения `RuntimeException: A WebView method was called on thread 'JavaBridge'` URL страницы кэшируется в `@Volatile currentWebViewUrl` в UI-коллбэках (`onPageStarted`, `onPageFinished`, `doUpdateVisitedHistory`), а доступ к методам экземпляра WebView выполняется строго внутри `runOnUiThread`.
+11. **W3C Web Notifications API, Smart WakeLock и управление сессией:**
+    - Document-Start JS реализует полный W3C polyfill для `window.Notification` и `ServiceWorkerRegistration.prototype.showNotification`, замаскированный через WeakMap (`[native code]`).
+    - Нативный шлюз `ClaudeCageNotificationBridge` фильтрует origin, выводит Heads-Up уведомления (`IMPORTANCE_HIGH`) с `BigTextStyle` и пробрасывает клики в чат (`window.__dispatchNotificationClick`).
+    - **Smart `PARTIAL_WAKE_LOCK`:** в `MainActivity.onStop()` WakeLock захватывается исключительно при наличии свежего сетевого трафика через прокси за последние 15 секунд (`hasRecentTraffic(15_000L)` на базе отслеживания байтов в `pipe()`), что устраняет ложные срабатывания и разрядку батареи из-за неактивных keep-alive пулов Chromium.
+    - **Комплексный сброс сессии (`purgeProfileSession`):** точечно очищает `ProfileStore`, кэш рендерера и аппаратный Keystore Fallback Cookie Jar (`deleteCookies(profile.id)`), а в статус-бар вынесена кнопка быстрой перезагрузки страницы `btnReload` (`🔄`).
 
 ---
 
@@ -222,7 +227,7 @@ app/src/main/java/com/example/claudecageand/
 | Тестовый класс | Расположение | Проверяемый функционал |
 | :--- | :--- | :--- |
 | `TunnelDnsResolverTest` | `app/src/test/.../net/` | Watchdog таймауты, `staleCache` fallback, кэширование, canary NODATA, TCP DNS |
-| `VpnGatekeeperProxyTest` | `app/src/test/.../net/` | Блокировка при VPN Off, разрыв сокетов, блокировка IPv6 (0x08), блокировка доменов СНГ (.ru/.by/.su), Network binding |
+| `VpnGatekeeperProxyTest` | `app/src/test/.../net/` | Блокировка при VPN Off, разрыв сокетов, блокировка IPv6 (0x08), блокировка доменов СНГ (.ru/.by/.su), Network binding, проверка активности трафика `hasRecentTraffic` |
 | `VpnTunnelStateTest` | `app/src/test/.../net/` | Модели состояний туннеля, равенство и форматирование |
 | `AntiFingerprintHardenerTest` | `app/src/test/.../security/` | Canvas шум для seed 0, `toBlob`, `speechSynthesis`, `Intl` en-US, `webdriver` |
 | `AccountProfileManagerTest` | `app/src/test/.../accounts/` | Создание, переименование, удаление, переключение профилей, seed |
@@ -251,4 +256,5 @@ app/src/main/java/com/example/claudecageand/
 3. **Блокирующие системные вызовы сокетов и пулы потоков:** Никогда не полагаться только на `withTimeoutOrNull` для прерывания вызовов вроде `Socket.connect()` или `InputStream.read()`. Для DNS-запросов обязательно использовать выделенный `ScheduledExecutorService` watchdog, не зависящий от корутинного пула. Длительный двунаправленный ретрансляционный I/O сокетов (`pipe`) выносить исключительно в отдельный пул потоков (`relayExecutor`), не занимая ограниченный `Dispatchers.IO` (лимит 64 потока).
 4. **Безопасность криптографии AndroidKeyStore:** При шифровании AES-GCM не передавать собственный IV в `cipher.init(Cipher.ENCRYPT_MODE, key)`. Доверять генерацию случайного IV аппаратному провайдеру Keystore, считывать сгенерированный IV через `cipher.iv` и сохранять его с префиксом к шифротексту. Всегда связывать AAD с контекстом сущности (например, `profileId`).
 5. **Сохранение совместимости с JVM Unit Tests:** Классы, взаимодействующие с Android Keystore, ProfileStore или системными сервисами, обязаны иметь безопасный fallback/mock для прохождения тестов `./gradlew testDebugUnitTest` на хост-машине разработчика.
-6. **Не трогать dotfiles без инструкции:** В соответствии с пользовательскими правилами, любые изменения в dotfiles требуют предварительного создания ветки в git bare репозитории и бэкапа в `~/.config-backups/`.
+6. **Потокобезопасность JS-интерфейсов Chromium (`@JavascriptInterface`):** Методы, аннотированные `@JavascriptInterface`, выполняются Chromium на выделенном потоке `JavaBridge`. Прямое обращение к `WebView` (например, `webView.url`) из этих методов приводит к `RuntimeException`. Для валидации Origin использовать потокобезопасные кэшированные переменные (`@Volatile currentWebViewUrl`), обновляемые в UI-коллбэках `WebViewClient`, а доступ к экземпляру WebView осуществлять строго внутри `activity.runOnUiThread { ... }`.
+7. **Не трогать dotfiles без инструкции:** В соответствии с пользовательскими правилами, любые изменения в dotfiles требуют предварительного создания ветки в git bare репозитории и бэкапа в `~/.config-backups/`.

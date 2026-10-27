@@ -22,6 +22,7 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.URLUtil
@@ -114,6 +115,9 @@ class MainActivity : AppCompatActivity() {
 
     private var isTopBarCollapsed: Boolean = false
     private var backgroundWakeLock: PowerManager.WakeLock? = null
+
+    @Volatile
+    private var currentWebViewUrl: String? = CLAUDE_URL
 
     private var webView: WebView? = null
     private var isProxyOverrideActive = false
@@ -367,6 +371,7 @@ class MainActivity : AppCompatActivity() {
         btnReturnToClaude.setOnClickListener {
             it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
             btnReturnToClaude.visibility = View.GONE
+            currentWebViewUrl = CLAUDE_URL
             webView?.loadUrl(CLAUDE_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
         }
         btnAccountSwitcher.setOnClickListener {
@@ -535,8 +540,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
-        val active = app.vpnGatekeeperProxy.activeSocketCount
-        if (active > 0) {
+        if (app.vpnGatekeeperProxy.hasRecentTraffic(15_000L)) {
             acquireBackgroundWakeLock()
         }
     }
@@ -720,13 +724,24 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
 
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                currentWebViewUrl = url ?: CLAUDE_URL
+            }
+
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
+                currentWebViewUrl = url ?: CLAUDE_URL
                 if (url?.contains("browserleaks.com") == true) {
                     btnReturnToClaude.visibility = View.VISIBLE
                 } else if (url?.contains("claude.ai") == true) {
                     btnReturnToClaude.visibility = View.GONE
                 }
+            }
+
+            override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                super.doUpdateVisitedHistory(view, url, isReload)
+                currentWebViewUrl = url ?: CLAUDE_URL
             }
         }
 
@@ -763,9 +778,15 @@ class MainActivity : AppCompatActivity() {
         // Wire SafeDownloadBridge with origin verification
         wv.addJavascriptInterface(
             SafeDownloadBridge(
-                getActiveUrl = { wv.url },
+                getActiveUrl = { currentWebViewUrl },
                 onDownloaded = { bytes, filename, _ ->
                     runOnUiThread {
+                        val activeUrl = currentWebViewUrl ?: webView?.url ?: ""
+                        if (!activeUrl.startsWith("https://claude.ai/") && activeUrl != "https://claude.ai") {
+                            val lang = app.uiLanguageManager.language.value
+                            Toast.makeText(this, UiStrings.toastDownloadFailed(lang, "unauthorized origin ($activeUrl)"), Toast.LENGTH_SHORT).show()
+                            return@runOnUiThread
+                        }
                         pendingDownloadBytes = bytes
                         pendingDownloadFilename = filename.ifBlank { "claude_artifact.txt" }
                         createDocumentLauncher.launch(pendingDownloadFilename)
@@ -784,7 +805,7 @@ class MainActivity : AppCompatActivity() {
         // Wire W3C Web Notification Bridge
         val notifBridge = ClaudeCageNotificationBridge(
             activity = this,
-            getActiveUrl = { wv.url },
+            getActiveUrl = { currentWebViewUrl },
             webViewProvider = { webView },
             onRequestPermission = { reqId ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -833,6 +854,7 @@ class MainActivity : AppCompatActivity() {
         if (initialVpnState is VpnTunnelState.Connected) {
             wv.setNetworkAvailable(true)
             waitingOverlay.visibility = View.GONE
+            currentWebViewUrl = CLAUDE_URL
             wv.loadUrl(CLAUDE_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
             hasLoadedInitialUrl = true
         } else {
@@ -1167,6 +1189,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun purgeProfileSession(profile: AccountProfile) {
         try {
+            app.accountProfileManager.fallback.deleteCookies(profile.id)
             if (WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)) {
                 val profileStore = ProfileStore.getInstance()
                 val p = profileStore.getOrCreateProfile(profile.storageKey)
@@ -1177,6 +1200,7 @@ class MainActivity : AppCompatActivity() {
                 android.webkit.WebStorage.getInstance().deleteAllData()
             }
             webView?.clearCache(true)
+            currentWebViewUrl = CLAUDE_URL
             webView?.loadUrl(CLAUDE_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
             app.auditLogger.logInfo("Accounts", "Purged session and cache for profile: ${profile.displayName}")
         } catch (e: Exception) {
@@ -1204,6 +1228,7 @@ class MainActivity : AppCompatActivity() {
 
                     if (!hasLoadedInitialUrl) {
                         waitingOverlay.visibility = View.GONE
+                        currentWebViewUrl = CLAUDE_URL
                         wv.loadUrl(CLAUDE_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
                         hasLoadedInitialUrl = true
                     }
@@ -1559,6 +1584,7 @@ class MainActivity : AppCompatActivity() {
         val btnLeaks = createActionButton(UiStrings.btnBrowserLeaks(lang)) {
             dialogRef?.dismiss()
             btnReturnToClaude.visibility = View.VISIBLE
+            currentWebViewUrl = DIAGNOSTIC_URL
             webView?.loadUrl(DIAGNOSTIC_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
         }
         val btnClear = createActionButton(UiStrings.btnClearLogs(lang)) {

@@ -397,6 +397,7 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.URLUtil
@@ -489,6 +490,9 @@ class MainActivity : AppCompatActivity() {
 
     private var isTopBarCollapsed: Boolean = false
     private var backgroundWakeLock: PowerManager.WakeLock? = null
+
+    @Volatile
+    private var currentWebViewUrl: String? = PORTAL_URL
 
     private var webView: WebView? = null
     private var isProxyOverrideActive = false
@@ -742,6 +746,7 @@ class MainActivity : AppCompatActivity() {
         btnReturnToPortal.setOnClickListener {
             it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
             btnReturnToPortal.visibility = View.GONE
+            currentWebViewUrl = PORTAL_URL
             webView?.loadUrl(PORTAL_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
         }
         btnAccountSwitcher.setOnClickListener {
@@ -910,8 +915,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
-        val active = app.vpnGatekeeperProxy.activeSocketCount
-        if (active > 0) {
+        if (app.vpnGatekeeperProxy.hasRecentTraffic(15_000L)) {
             acquireBackgroundWakeLock()
         }
     }
@@ -1095,13 +1099,24 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
 
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                currentWebViewUrl = url ?: PORTAL_URL
+            }
+
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
+                currentWebViewUrl = url ?: PORTAL_URL
                 if (url?.contains("browserleaks.com") == true) {
                     btnReturnToPortal.visibility = View.VISIBLE
                 } else if (url?.contains("portal.internal-enterprise.net") == true) {
                     btnReturnToPortal.visibility = View.GONE
                 }
+            }
+
+            override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                super.doUpdateVisitedHistory(view, url, isReload)
+                currentWebViewUrl = url ?: PORTAL_URL
             }
         }
 
@@ -1138,9 +1153,15 @@ class MainActivity : AppCompatActivity() {
         // Wire SafeDownloadBridge with origin verification
         wv.addJavascriptInterface(
             SafeDownloadBridge(
-                getActiveUrl = { wv.url },
+                getActiveUrl = { currentWebViewUrl },
                 onDownloaded = { bytes, filename, _ ->
                     runOnUiThread {
+                        val activeUrl = currentWebViewUrl ?: webView?.url ?: ""
+                        if (!activeUrl.startsWith("https://portal.internal-enterprise.net/") && activeUrl != "https://portal.internal-enterprise.net") {
+                            val lang = app.uiLanguageManager.language.value
+                            Toast.makeText(this, UiStrings.toastDownloadFailed(lang, "unauthorized origin ($activeUrl)"), Toast.LENGTH_SHORT).show()
+                            return@runOnUiThread
+                        }
                         pendingDownloadBytes = bytes
                         pendingDownloadFilename = filename.ifBlank { "enclave_artifact.txt" }
                         createDocumentLauncher.launch(pendingDownloadFilename)
@@ -1159,7 +1180,7 @@ class MainActivity : AppCompatActivity() {
         // Wire W3C Web Notification Bridge
         val notifBridge = EnclaveNotificationBridge(
             activity = this,
-            getActiveUrl = { wv.url },
+            getActiveUrl = { currentWebViewUrl },
             webViewProvider = { webView },
             onRequestPermission = { reqId ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -1208,6 +1229,7 @@ class MainActivity : AppCompatActivity() {
         if (initialVpnState is VpnTunnelState.Connected) {
             wv.setNetworkAvailable(true)
             waitingOverlay.visibility = View.GONE
+            currentWebViewUrl = PORTAL_URL
             wv.loadUrl(PORTAL_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
             hasLoadedInitialUrl = true
         } else {
@@ -1542,6 +1564,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun purgeProfileSession(profile: AccountProfile) {
         try {
+            app.accountProfileManager.fallback.deleteCookies(profile.id)
             if (WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)) {
                 val profileStore = ProfileStore.getInstance()
                 val p = profileStore.getOrCreateProfile(profile.storageKey)
@@ -1552,6 +1575,7 @@ class MainActivity : AppCompatActivity() {
                 android.webkit.WebStorage.getInstance().deleteAllData()
             }
             webView?.clearCache(true)
+            currentWebViewUrl = PORTAL_URL
             webView?.loadUrl(PORTAL_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
             app.auditLogger.logInfo("Accounts", "Purged session and cache for profile: ${profile.displayName}")
         } catch (e: Exception) {
@@ -1579,6 +1603,7 @@ class MainActivity : AppCompatActivity() {
 
                     if (!hasLoadedInitialUrl) {
                         waitingOverlay.visibility = View.GONE
+                        currentWebViewUrl = PORTAL_URL
                         wv.loadUrl(PORTAL_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
                         hasLoadedInitialUrl = true
                     }
@@ -1934,6 +1959,7 @@ class MainActivity : AppCompatActivity() {
         val btnLeaks = createActionButton(UiStrings.btnBrowserLeaks(lang)) {
             dialogRef?.dismiss()
             btnReturnToPortal.visibility = View.VISIBLE
+            currentWebViewUrl = DIAGNOSTIC_URL
             webView?.loadUrl(DIAGNOSTIC_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
         }
         val btnClear = createActionButton(UiStrings.btnClearLogs(lang)) {
@@ -2896,6 +2922,18 @@ class VpnGatekeeperProxy(
     private val outboundSockets = ConcurrentHashMap<Socket, Long>()
     private val isRunning = AtomicBoolean(false)
 
+    @Volatile
+    var lastTrafficTimestampMillis: Long = 0L
+
+    /**
+     * Checks whether active streaming traffic has passed through the SOCKS5 proxy within [windowMs].
+     * Prevents false-positive WakeLock triggers when Chromium keeps idle HTTP/2 or Intercom WebSocket
+     * connections alive in the background pool.
+     */
+    fun hasRecentTraffic(windowMs: Long = 15_000L): Boolean {
+        return activeSockets.isNotEmpty() && (System.currentTimeMillis() - lastTrafficTimestampMillis) < windowMs
+    }
+
     // Synchronous tunnel listener for instant kill-switch and handover tracking
     private val tunnelListener = TunnelListener { _, current ->
         when (current) {
@@ -3349,6 +3387,7 @@ class VpnGatekeeperProxy(
                 if (bytesRead == -1) break
                 output.write(buffer, 0, bytesRead)
                 output.flush()
+                lastTrafficTimestampMillis = System.currentTimeMillis()
                 onBytes(bytesRead.toLong())
             }
         } catch (_: SocketException) {
@@ -4576,6 +4615,12 @@ class EnclaveNotificationBridge(
             return
         }
         activity.runOnUiThread {
+            val verifiedUrl = getActiveUrl() ?: webViewProvider()?.url
+            if (!isOriginPermitted(verifiedUrl)) {
+                auditLogger.logWarning("Notification", "Blocked permission request from unauthorized origin on UI thread: $verifiedUrl")
+                resolveJsPermission(reqId, "denied")
+                return@runOnUiThread
+            }
             if (hasNotificationPermission()) {
                 resolveJsPermission(reqId, "granted")
             } else {
@@ -4600,6 +4645,12 @@ class EnclaveNotificationBridge(
         }
 
         activity.runOnUiThread {
+            val verifiedUrl = getActiveUrl() ?: webViewProvider()?.url
+            if (!isOriginPermitted(verifiedUrl)) {
+                auditLogger.logWarning("Notification", "Blocked notification from unauthorized origin on UI thread: $verifiedUrl")
+                return@runOnUiThread
+            }
+
             if (!hasNotificationPermission()) {
                 auditLogger.logWarning("Notification", "Cannot display notification $notifId: permission not granted")
                 return@runOnUiThread
@@ -6858,6 +6909,50 @@ class VpnGatekeeperProxyTest {
         assertTrue(isAllowed("portal.internal-enterprise.net"))
         assertTrue(isAllowed("cdn.portal.internal-enterprise.net"))
         assertFalse(isAllowed("evil.hacker.com"))
+    }
+
+    @Test
+    fun hasRecentTraffic_returnsTrueOnlyWhenTrafficIsFresh() {
+        val monitor = VpnStateMonitor(mockContext, mockConnectivityManager)
+        val proxy = VpnGatekeeperProxy(mockContext, monitor)
+
+        try {
+            // Case 1: No active sockets -> false even if timestamp is fresh
+            proxy.lastTrafficTimestampMillis = System.currentTimeMillis()
+            assertFalse(proxy.hasRecentTraffic(15_000L))
+
+            // Start proxy so server accepts connection
+            proxy.start()
+
+            val loopback = InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
+            val client = Socket(loopback, proxy.listeningPort)
+            client.soTimeout = 3000
+
+            // Wait briefly for accept loop to register client in activeSockets
+            var attempts = 0
+            while (proxy.activeSocketCount == 0 && attempts < 20) {
+                Thread.sleep(25)
+                attempts++
+            }
+            assertTrue("Client should be in activeSockets", proxy.activeSocketCount > 0)
+
+            // Case 2: Active socket exists, but no traffic yet (timestamp = 0L)
+            proxy.lastTrafficTimestampMillis = 0L
+            assertFalse(proxy.hasRecentTraffic(15_000L))
+
+            // Case 3: Active socket exists, and traffic was within window
+            proxy.lastTrafficTimestampMillis = System.currentTimeMillis() - 5_000L
+            assertTrue(proxy.hasRecentTraffic(15_000L))
+
+            // Case 4: Active socket exists, but traffic is older than window (e.g. idle keep-alive socket)
+            proxy.lastTrafficTimestampMillis = System.currentTimeMillis() - 25_000L
+            assertFalse(proxy.hasRecentTraffic(15_000L))
+
+            client.close()
+        } finally {
+            proxy.stop()
+            monitor.stopMonitoring()
+        }
     }
 }
 

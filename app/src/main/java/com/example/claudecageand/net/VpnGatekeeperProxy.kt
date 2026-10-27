@@ -89,6 +89,18 @@ class VpnGatekeeperProxy(
     private val outboundSockets = ConcurrentHashMap<Socket, Long>()
     private val isRunning = AtomicBoolean(false)
 
+    @Volatile
+    var lastTrafficTimestampMillis: Long = 0L
+
+    /**
+     * Checks whether active streaming traffic has passed through the SOCKS5 proxy within [windowMs].
+     * Prevents false-positive WakeLock triggers when Chromium keeps idle HTTP/2 or Intercom WebSocket
+     * connections alive in the background pool.
+     */
+    fun hasRecentTraffic(windowMs: Long = 15_000L): Boolean {
+        return activeSockets.isNotEmpty() && (System.currentTimeMillis() - lastTrafficTimestampMillis) < windowMs
+    }
+
     // Synchronous tunnel listener for instant kill-switch and handover tracking
     private val tunnelListener = TunnelListener { _, current ->
         when (current) {
@@ -542,6 +554,7 @@ class VpnGatekeeperProxy(
                 if (bytesRead == -1) break
                 output.write(buffer, 0, bytesRead)
                 output.flush()
+                lastTrafficTimestampMillis = System.currentTimeMillis()
                 onBytes(bytesRead.toLong())
             }
         } catch (_: SocketException) {

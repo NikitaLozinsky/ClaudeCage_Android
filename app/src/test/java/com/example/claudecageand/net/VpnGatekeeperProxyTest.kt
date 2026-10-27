@@ -405,4 +405,48 @@ class VpnGatekeeperProxyTest {
         assertTrue(isAllowed("cdn.claude.ai"))
         assertFalse(isAllowed("evil.hacker.com"))
     }
+
+    @Test
+    fun hasRecentTraffic_returnsTrueOnlyWhenTrafficIsFresh() {
+        val monitor = VpnStateMonitor(mockContext, mockConnectivityManager)
+        val proxy = VpnGatekeeperProxy(mockContext, monitor)
+
+        try {
+            // Case 1: No active sockets -> false even if timestamp is fresh
+            proxy.lastTrafficTimestampMillis = System.currentTimeMillis()
+            assertFalse(proxy.hasRecentTraffic(15_000L))
+
+            // Start proxy so server accepts connection
+            proxy.start()
+
+            val loopback = InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
+            val client = Socket(loopback, proxy.listeningPort)
+            client.soTimeout = 3000
+
+            // Wait briefly for accept loop to register client in activeSockets
+            var attempts = 0
+            while (proxy.activeSocketCount == 0 && attempts < 20) {
+                Thread.sleep(25)
+                attempts++
+            }
+            assertTrue("Client should be in activeSockets", proxy.activeSocketCount > 0)
+
+            // Case 2: Active socket exists, but no traffic yet (timestamp = 0L)
+            proxy.lastTrafficTimestampMillis = 0L
+            assertFalse(proxy.hasRecentTraffic(15_000L))
+
+            // Case 3: Active socket exists, and traffic was within window
+            proxy.lastTrafficTimestampMillis = System.currentTimeMillis() - 5_000L
+            assertTrue(proxy.hasRecentTraffic(15_000L))
+
+            // Case 4: Active socket exists, but traffic is older than window (e.g. idle keep-alive socket)
+            proxy.lastTrafficTimestampMillis = System.currentTimeMillis() - 25_000L
+            assertFalse(proxy.hasRecentTraffic(15_000L))
+
+            client.close()
+        } finally {
+            proxy.stop()
+            monitor.stopMonitoring()
+        }
+    }
 }

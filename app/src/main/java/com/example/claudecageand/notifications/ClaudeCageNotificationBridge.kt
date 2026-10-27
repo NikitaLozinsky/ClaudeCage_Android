@@ -83,6 +83,12 @@ class ClaudeCageNotificationBridge(
             return
         }
         activity.runOnUiThread {
+            val verifiedUrl = getActiveUrl() ?: webViewProvider()?.url
+            if (!isOriginPermitted(verifiedUrl)) {
+                auditLogger.logWarning("Notification", "Blocked permission request from unauthorized origin on UI thread: $verifiedUrl")
+                resolveJsPermission(reqId, "denied")
+                return@runOnUiThread
+            }
             if (hasNotificationPermission()) {
                 resolveJsPermission(reqId, "granted")
             } else {
@@ -107,6 +113,12 @@ class ClaudeCageNotificationBridge(
         }
 
         activity.runOnUiThread {
+            val verifiedUrl = getActiveUrl() ?: webViewProvider()?.url
+            if (!isOriginPermitted(verifiedUrl)) {
+                auditLogger.logWarning("Notification", "Blocked notification from unauthorized origin on UI thread: $verifiedUrl")
+                return@runOnUiThread
+            }
+
             if (!hasNotificationPermission()) {
                 auditLogger.logWarning("Notification", "Cannot display notification $notifId: permission not granted")
                 return@runOnUiThread
