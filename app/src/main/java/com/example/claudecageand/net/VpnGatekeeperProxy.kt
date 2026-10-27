@@ -116,7 +116,7 @@ class VpnGatekeeperProxy(
             }
             is VpnTunnelState.Disconnected -> {
                 closeAllActiveSockets()
-                dnsResolver.clearCache()
+                dnsResolver.clearCache(clearStale = false)
             }
         }
     }
@@ -444,11 +444,23 @@ class VpnGatekeeperProxy(
 
             // --- Step 4: Bind Outbound Socket to VPN ---
             try {
-                // Critical Zero-Trust Fix: Android Network binding is mandatory
-                currentTunnelState.network.bindSocket(outbound)
+                // Resilient Android Network binding (handles third-party VPN permission quirks on One UI 9)
+                try {
+                    currentTunnelState.network.bindSocket(outbound)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Network.bindSocket non-fatal warning on VPN network: ${e.message}")
+                    auditLogger?.log(
+                        LogCategory.PROXY,
+                        LogLevel.WARN,
+                        "Network.bindSocket warning: ${e.message}"
+                    )
+                }
 
                 // Kernel-level fail-closed enforcement: bind socket to tunnel's local IPv4
                 outbound.bind(InetSocketAddress(currentTunnelState.tunIpv4, 0))
+                if (outbound.localAddress != currentTunnelState.tunIpv4) {
+                    throw IOException("Outbound socket localAddress ${outbound.localAddress} != tunIpv4 ${currentTunnelState.tunIpv4}")
+                }
 
                 // Check again right before TCP SYN to defeat any microsecond races
                 val verifiedTunnel = vpnStateMonitor.getCurrentTunnelState()
@@ -600,13 +612,28 @@ class VpnGatekeeperProxy(
         val ALLOWED_DOMAIN_SUFFIXES = setOf(
             "claude.ai",
             "anthropic.com",
+            "claude.com",
+            "cloudflare.com",
+            "hcaptcha.com",
+            "stripe.com",
+            "stripe.network",
             "intercom.io",
+            "intercomcdn.com",
             "statsig.com",
-            "browserleaks.com",
+            "statsigapi.net",
+            "datadoghq.com",
+            "sentry.io",
             "google.com",
             "gstatic.com",
             "googleapis.com",
-            "appleid.apple.com"
+            "googleusercontent.com",
+            "youtube.com",
+            "apple.com",
+            "appleid.apple.com",
+            "browserleaks.com",
+            "browserleaks.net",
+            "browserleaks.org",
+            "ripe.net"
         )
     }
 }

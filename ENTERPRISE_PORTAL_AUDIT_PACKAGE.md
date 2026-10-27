@@ -2511,12 +2511,21 @@ class TunnelDnsResolver(
                 return DnsResponse(address = null, isNoData = true, rcode = 0)
             }
 
-            // Skip questions
+            // Verify questions and QNAME
             for (i in 0 until qdCount) {
-                skipDnsName(buffer)
+                val qName = readDnsName(buffer, responseBytes)
                 if (buffer.remaining() < 4) return DnsResponse(isError = true)
                 buffer.short // QTYPE
                 buffer.short // QCLASS
+
+                if (expectedDomain != null && i == 0) {
+                    val normalizedExpected = expectedDomain.trim().trimEnd('.').lowercase(Locale.ROOT)
+                    val normalizedQname = qName?.trim()?.trimEnd('.')?.lowercase(Locale.ROOT)
+                    if (normalizedQname != normalizedExpected) {
+                        Log.w(TAG, "DNS QNAME mismatch: expected '$normalizedExpected', got '$normalizedQname'")
+                        return DnsResponse(isError = true)
+                    }
+                }
             }
 
             val aRecords = mutableListOf<Inet4Address>()
@@ -2552,6 +2561,41 @@ class TunnelDnsResolver(
             } else {
                 DnsResponse(address = null, isNoData = true, rcode = 0)
             }
+        }
+
+        private fun readDnsName(buffer: ByteBuffer, responseBytes: ByteArray): String? {
+            val sb = StringBuilder()
+            var jumped = false
+            var jumpPos = -1
+            var currentPos = buffer.position()
+            var loops = 0
+            val maxLoops = 128
+
+            while (loops++ < maxLoops) {
+                if (currentPos >= responseBytes.size) return null
+                val len = responseBytes[currentPos].toInt() and 0xFF
+                if (len == 0) {
+                    currentPos++
+                    break
+                }
+                if ((len and 0xC0) == 0xC0) {
+                    if (currentPos + 1 >= responseBytes.size) return null
+                    val offset = ((len and 0x3F) shl 8) or (responseBytes[currentPos + 1].toInt() and 0xFF)
+                    if (!jumped) {
+                        jumpPos = currentPos + 2
+                        jumped = true
+                    }
+                    currentPos = offset
+                } else {
+                    currentPos++
+                    if (currentPos + len > responseBytes.size) return null
+                    if (sb.isNotEmpty()) sb.append('.')
+                    sb.append(String(responseBytes, currentPos, len, Charsets.US_ASCII))
+                    currentPos += len
+                }
+            }
+            buffer.position(if (jumped) jumpPos else currentPos)
+            return sb.toString()
         }
 
         private fun skipDnsName(buffer: ByteBuffer) {
@@ -2705,7 +2749,7 @@ class VpnGatekeeperProxy(
             }
             is VpnTunnelState.Disconnected -> {
                 closeAllActiveSockets()
-                dnsResolver.clearCache()
+                dnsResolver.clearCache(clearStale = false)
             }
         }
     }
@@ -3033,11 +3077,23 @@ class VpnGatekeeperProxy(
 
             // --- Step 4: Bind Outbound Socket to VPN ---
             try {
-                // Critical Zero-Trust Fix: Android Network binding is mandatory
-                currentTunnelState.network.bindSocket(outbound)
+                // Resilient Android Network binding (handles third-party VPN permission quirks on One UI 9)
+                try {
+                    currentTunnelState.network.bindSocket(outbound)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Network.bindSocket non-fatal warning on VPN network: ${e.message}")
+                    auditLogger?.log(
+                        LogCategory.PROXY,
+                        LogLevel.WARN,
+                        "Network.bindSocket warning: ${e.message}"
+                    )
+                }
 
                 // Kernel-level fail-closed enforcement: bind socket to tunnel's local IPv4
                 outbound.bind(InetSocketAddress(currentTunnelState.tunIpv4, 0))
+                if (outbound.localAddress != currentTunnelState.tunIpv4) {
+                    throw IOException("Outbound socket localAddress ${outbound.localAddress} != tunIpv4 ${currentTunnelState.tunIpv4}")
+                }
 
                 // Check again right before TCP SYN to defeat any microsecond races
                 val verifiedTunnel = vpnStateMonitor.getCurrentTunnelState()
@@ -3189,13 +3245,28 @@ class VpnGatekeeperProxy(
         val ALLOWED_DOMAIN_SUFFIXES = setOf(
             "portal.internal-enterprise.net",
             "internal-enterprise.net",
+            "corporate portal.com",
+            "cloudflare.com",
+            "hcaptcha.com",
+            "stripe.com",
+            "stripe.network",
             "intercom.io",
+            "intercomcdn.com",
             "statsig.com",
-            "browserleaks.com",
+            "statsigapi.net",
+            "datadoghq.com",
+            "sentry.io",
             "google.com",
             "gstatic.com",
             "googleapis.com",
-            "appleid.apple.com"
+            "googleusercontent.com",
+            "youtube.com",
+            "apple.com",
+            "appleid.apple.com",
+            "browserleaks.com",
+            "browserleaks.net",
+            "browserleaks.org",
+            "ripe.net"
         )
     }
 }
@@ -3695,11 +3766,23 @@ object AntiFingerprintHardener {
             try {
                 const NOISE_OFFSET = $noiseOffset;
 
+                const applyNoise = (data) => {
+                    if (!data || data.length < 4) return;
+                    let targetIdx = 0;
+                    for (let i = 0; i < data.length; i += 4) {
+                        if (data[i + 3] > 0) {
+                            targetIdx = i;
+                            break;
+                        }
+                    }
+                    data[targetIdx] = (data[targetIdx] + NOISE_OFFSET) % 256;
+                };
+
                 const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
                 CanvasRenderingContext2D.prototype.getImageData = cloak(function(sx, sy, sw, sh, settings) {
                     const imgData = origGetImageData.call(this, sx, sy, sw, sh, settings);
-                    if (imgData && imgData.data && imgData.data.length >= 4) {
-                        imgData.data[0] = (imgData.data[0] + NOISE_OFFSET) % 256;
+                    if (imgData && imgData.data) {
+                        applyNoise(imgData.data);
                     }
                     return imgData;
                 }, 'getImageData');
@@ -3714,10 +3797,12 @@ object AntiFingerprintHardener {
                             const offCtx = offscreen.getContext('2d');
                             if (offCtx) {
                                 offCtx.drawImage(this, 0, 0);
-                                const pixel = origGetImageData.call(offCtx, 0, 0, 1, 1);
-                                if (pixel && pixel.data && pixel.data.length >= 4) {
-                                    pixel.data[0] = (pixel.data[0] + NOISE_OFFSET) % 256;
-                                    offCtx.putImageData(pixel, 0, 0);
+                                const sampleW = Math.min(this.width, 32);
+                                const sampleH = Math.min(this.height, 32);
+                                const sample = origGetImageData.call(offCtx, 0, 0, sampleW, sampleH);
+                                if (sample && sample.data) {
+                                    applyNoise(sample.data);
+                                    offCtx.putImageData(sample, 0, 0);
                                 }
                                 return origToDataURL.call(offscreen, type, encoderOptions);
                             }
@@ -3736,10 +3821,12 @@ object AntiFingerprintHardener {
                             const offCtx = offscreen.getContext('2d');
                             if (offCtx) {
                                 offCtx.drawImage(this, 0, 0);
-                                const pixel = origGetImageData.call(offCtx, 0, 0, 1, 1);
-                                if (pixel && pixel.data && pixel.data.length >= 4) {
-                                    pixel.data[0] = (pixel.data[0] + NOISE_OFFSET) % 256;
-                                    offCtx.putImageData(pixel, 0, 0);
+                                const sampleW = Math.min(this.width, 32);
+                                const sampleH = Math.min(this.height, 32);
+                                const sample = origGetImageData.call(offCtx, 0, 0, sampleW, sampleH);
+                                if (sample && sample.data) {
+                                    applyNoise(sample.data);
+                                    offCtx.putImageData(sample, 0, 0);
                                 }
                                 return origToBlob.call(offscreen, callback, type, quality);
                             }
@@ -3763,6 +3850,7 @@ object AntiFingerprintHardener {
                 }
                 return origToString.call(this);
             };
+            nativeMap.set(Function.prototype.toString, 'toString');
             const cloak = (fn, name) => {
                 try {
                     nativeMap.set(fn, name);
@@ -3841,36 +3929,36 @@ object AntiFingerprintHardener {
             };
 
             try {
-                Date.prototype.getTimezoneOffset = function() {
+                Date.prototype.getTimezoneOffset = cloak(function() {
                     return computeAmsterdamOffset(this);
-                };
+                }, 'getTimezoneOffset');
             } catch (e) {}
 
             try {
                 const OrigDTF = Intl.DateTimeFormat;
-                const ProxyDTF = function(locales, options) {
+                const ProxyDTF = cloak(function(locales, options) {
                     const opts = Object.assign({}, options);
                     if (!opts.timeZone) {
                         opts.timeZone = TARGET_TIMEZONE;
                     }
                     return new OrigDTF(locales || 'en-US', opts);
-                };
+                }, 'DateTimeFormat');
                 ProxyDTF.prototype = OrigDTF.prototype;
                 ProxyDTF.supportedLocalesOf = OrigDTF.supportedLocalesOf;
 
                 const origResolvedOptions = OrigDTF.prototype.resolvedOptions;
-                OrigDTF.prototype.resolvedOptions = function() {
+                OrigDTF.prototype.resolvedOptions = cloak(function() {
                     const res = origResolvedOptions.call(this);
                     res.timeZone = TARGET_TIMEZONE;
                     return res;
-                };
+                }, 'resolvedOptions');
 
                 Intl.DateTimeFormat = ProxyDTF;
             } catch (e) {}
 
             // 5. Date string representations in Europe/Amsterdam (en-US)
             try {
-                Date.prototype.toString = function() {
+                Date.prototype.toString = cloak(function() {
                     if (isNaN(this.getTime())) return 'Invalid Date';
                     try {
                         const dtf = new OrigDTF('en-US', {
@@ -3896,9 +3984,9 @@ object AntiFingerprintHardener {
                     } catch (err) {
                         return 'Invalid Date';
                     }
-                };
+                }, 'toString');
 
-                Date.prototype.toTimeString = function() {
+                Date.prototype.toTimeString = cloak(function() {
                     if (isNaN(this.getTime())) return 'Invalid Date';
                     try {
                         const dtf = new OrigDTF('en-US', {
@@ -3920,28 +4008,28 @@ object AntiFingerprintHardener {
                     } catch (err) {
                         return 'Invalid Date';
                     }
-                };
+                }, 'toTimeString');
 
                 const origToLocaleString = Date.prototype.toLocaleString;
-                Date.prototype.toLocaleString = function(locales, options) {
+                Date.prototype.toLocaleString = cloak(function(locales, options) {
                     const opts = Object.assign({}, options);
                     if (!opts.timeZone) opts.timeZone = TARGET_TIMEZONE;
                     return origToLocaleString.call(this, locales || 'en-US', opts);
-                };
+                }, 'toLocaleString');
 
                 const origToLocaleDateString = Date.prototype.toLocaleDateString;
-                Date.prototype.toLocaleDateString = function(locales, options) {
+                Date.prototype.toLocaleDateString = cloak(function(locales, options) {
                     const opts = Object.assign({}, options);
                     if (!opts.timeZone) opts.timeZone = TARGET_TIMEZONE;
                     return origToLocaleDateString.call(this, locales || 'en-US', opts);
-                };
+                }, 'toLocaleDateString');
 
                 const origToLocaleTimeString = Date.prototype.toLocaleTimeString;
-                Date.prototype.toLocaleTimeString = function(locales, options) {
+                Date.prototype.toLocaleTimeString = cloak(function(locales, options) {
                     const opts = Object.assign({}, options);
                     if (!opts.timeZone) opts.timeZone = TARGET_TIMEZONE;
                     return origToLocaleTimeString.call(this, locales || 'en-US', opts);
-                };
+                }, 'toLocaleTimeString');
             } catch (e) {}
 
             // 6. Deterministic Hardware Concurrency & Device Memory Spoofing
@@ -3974,11 +4062,11 @@ object AntiFingerprintHardener {
                 const lockLocale = (proto) => {
                     if (proto && proto.resolvedOptions) {
                         const orig = proto.resolvedOptions;
-                        proto.resolvedOptions = function() {
+                        proto.resolvedOptions = cloak(function() {
                             const res = orig.call(this);
                             if (res) res.locale = 'en-US';
                             return res;
-                        };
+                        }, 'resolvedOptions');
                     }
                 };
                 if (window.Intl) {
@@ -5396,6 +5484,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
 import java.net.Inet4Address
+import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -5668,6 +5757,70 @@ class TunnelDnsResolverTest {
         val picked = parsed.address!!.hostAddress
         assertTrue(picked == "104.18.2.3" || picked == "104.18.3.4")
     }
+
+    @Test
+    fun parseTcpDnsResponse_verifiesQname() {
+        val queryId = 0xABCD
+        val out = ByteArrayOutputStream()
+        val header = ByteBuffer.allocate(12).order(ByteOrder.BIG_ENDIAN)
+        header.putShort(queryId.toShort())
+        header.putShort(0x8180.toShort())
+        header.putShort(1.toShort())      // QDCOUNT = 1
+        header.putShort(1.toShort())      // ANCOUNT = 1
+        header.putShort(0.toShort())
+        header.putShort(0.toShort())
+        out.write(header.array())
+
+        // Question: portal.internal-enterprise.net IN A
+        out.write(byteArrayOf(6, 'c'.code.toByte(), 'l'.code.toByte(), 'a'.code.toByte(), 'u'.code.toByte(), 'd'.code.toByte(), 'e'.code.toByte()))
+        out.write(byteArrayOf(2, 'a'.code.toByte(), 'i'.code.toByte()))
+        out.write(0)
+        val qtail = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
+        qtail.putShort(1.toShort())
+        qtail.putShort(1.toShort())
+        out.write(qtail.array())
+
+        // Answer
+        out.write(byteArrayOf(0xC0.toByte(), 0x0C.toByte()))
+        val atail = ByteBuffer.allocate(10).order(ByteOrder.BIG_ENDIAN)
+        atail.putShort(1.toShort())
+        atail.putShort(1.toShort())
+        atail.putInt(300)
+        atail.putShort(4.toShort())
+        out.write(atail.array())
+        out.write(byteArrayOf(104, 18, 2, 3))
+
+        val responseBytes = out.toByteArray()
+
+        // Correct domain matches
+        val match = TunnelDnsResolver.parseTcpDnsResponse(responseBytes, queryId, "portal.internal-enterprise.net")
+        assertFalse(match.isError)
+        assertEquals(InetAddress.getByAddress(byteArrayOf(104, 18, 2, 3)), match.address)
+
+        // Case-insensitive & trailing dot matches
+        val matchCase = TunnelDnsResolver.parseTcpDnsResponse(responseBytes, queryId, "CLAUDE.AI.")
+        assertFalse(matchCase.isError)
+
+        // Mismatched domain fails with isError = true
+        val mismatch = TunnelDnsResolver.parseTcpDnsResponse(responseBytes, queryId, "attacker.com")
+        assertTrue(mismatch.isError)
+    }
+
+    @Test
+    fun clearCache_preservesStaleCacheWhenRequested() {
+        val resolver = TunnelDnsResolver()
+        val ip = InetAddress.getByAddress(byteArrayOf(104, 18, 2, 3)) as Inet4Address
+        resolver.putStaleEntryForTesting("portal.internal-enterprise.net", ip)
+        assertEquals(1, resolver.staleCacheSize)
+
+        // Clear without clearing stale
+        resolver.clearCache(clearStale = false)
+        assertEquals(1, resolver.staleCacheSize)
+
+        // Full clear
+        resolver.clearCache(clearStale = true)
+        assertEquals(0, resolver.staleCacheSize)
+    }
 }
 
 ```
@@ -5683,6 +5836,7 @@ package com.corp.enclaveshield.net
 import android.content.Context
 import android.net.ConnectivityManager
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -6059,6 +6213,31 @@ class VpnGatekeeperProxyTest {
             monitor.stopMonitoring()
         }
     }
+
+    @Test
+    fun allowsCloudflareTurnstileAndHcaptchaDomains() {
+        val allowed = VpnGatekeeperProxy.ALLOWED_DOMAIN_SUFFIXES
+        assertTrue(allowed.contains("cloudflare.com"))
+        assertTrue(allowed.contains("hcaptcha.com"))
+        assertTrue(allowed.contains("stripe.com"))
+        assertTrue(allowed.contains("intercomcdn.com"))
+        assertTrue(allowed.contains("statsigapi.net"))
+
+        fun isAllowed(domain: String): Boolean {
+            val clean = domain.trim().trimEnd('.').lowercase(java.util.Locale.ROOT)
+            return allowed.any { clean == it || clean.endsWith(".$it") }
+        }
+
+        assertTrue(isAllowed("challenges.cloudflare.com"))
+        assertTrue(isAllowed("js.hcaptcha.com"))
+        assertTrue(isAllowed("api.stripe.com"))
+        assertTrue(isAllowed("m.stripe.network"))
+        assertTrue(isAllowed("nexus-websocket-a.intercom.io"))
+        assertTrue(isAllowed("events.statsigapi.net"))
+        assertTrue(isAllowed("portal.internal-enterprise.net"))
+        assertTrue(isAllowed("cdn.portal.internal-enterprise.net"))
+        assertFalse(isAllowed("evil.hacker.com"))
+    }
 }
 
 ```
@@ -6155,6 +6334,28 @@ class AntiFingerprintHardenerTest {
 
         assertTrue("TimeZone ID should be Europe/Amsterdam", TimeZone.getDefault().id == "Europe/Amsterdam")
         assertTrue("Locale should be US", Locale.getDefault() == Locale.US)
+    }
+
+    @Test
+    fun documentStartJs_functionToStringCloakedAndAlphaPreserved() {
+        val js = AntiFingerprintHardener.DOCUMENT_START_JS
+
+        // Must register Function.prototype.toString in nativeMap
+        assertTrue("Must cloak Function.prototype.toString itself", js.contains("nativeMap.set(Function.prototype.toString, 'toString')"))
+
+        // Date and Intl hooks must be cloaked
+        assertTrue("Must cloak getTimezoneOffset", js.contains("'getTimezoneOffset'"))
+        assertTrue("Must cloak DateTimeFormat", js.contains("'DateTimeFormat'"))
+        assertTrue("Must cloak Date.prototype.toString", js.contains("Date.prototype.toString = cloak("))
+        assertTrue("Must cloak Date.prototype.toTimeString", js.contains("Date.prototype.toTimeString = cloak("))
+        assertTrue("Must cloak Date.prototype.toLocaleString", js.contains("Date.prototype.toLocaleString = cloak("))
+        assertTrue("Must cloak Date.prototype.toLocaleDateString", js.contains("Date.prototype.toLocaleDateString = cloak("))
+        assertTrue("Must cloak Date.prototype.toLocaleTimeString", js.contains("Date.prototype.toLocaleTimeString = cloak("))
+        assertTrue("Must cloak resolvedOptions", js.contains("'resolvedOptions'"))
+
+        // Non-transparent canvas noise scan
+        assertTrue("Must scan for non-transparent pixel (data[i + 3] > 0)", js.contains("data[i + 3] > 0"))
+        assertTrue("Must apply noise to targetIdx", js.contains("data[targetIdx] = (data[targetIdx] + NOISE_OFFSET) % 256"))
     }
 }
 

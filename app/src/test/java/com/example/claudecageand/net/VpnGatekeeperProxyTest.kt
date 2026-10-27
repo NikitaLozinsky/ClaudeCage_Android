@@ -3,6 +3,7 @@ package com.example.claudecageand.net
 import android.content.Context
 import android.net.ConnectivityManager
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -378,5 +379,30 @@ class VpnGatekeeperProxyTest {
             proxy.stop()
             monitor.stopMonitoring()
         }
+    }
+
+    @Test
+    fun allowsCloudflareTurnstileAndHcaptchaDomains() {
+        val allowed = VpnGatekeeperProxy.ALLOWED_DOMAIN_SUFFIXES
+        assertTrue(allowed.contains("cloudflare.com"))
+        assertTrue(allowed.contains("hcaptcha.com"))
+        assertTrue(allowed.contains("stripe.com"))
+        assertTrue(allowed.contains("intercomcdn.com"))
+        assertTrue(allowed.contains("statsigapi.net"))
+
+        fun isAllowed(domain: String): Boolean {
+            val clean = domain.trim().trimEnd('.').lowercase(java.util.Locale.ROOT)
+            return allowed.any { clean == it || clean.endsWith(".$it") }
+        }
+
+        assertTrue(isAllowed("challenges.cloudflare.com"))
+        assertTrue(isAllowed("js.hcaptcha.com"))
+        assertTrue(isAllowed("api.stripe.com"))
+        assertTrue(isAllowed("m.stripe.network"))
+        assertTrue(isAllowed("nexus-websocket-a.intercom.io"))
+        assertTrue(isAllowed("events.statsigapi.net"))
+        assertTrue(isAllowed("claude.ai"))
+        assertTrue(isAllowed("cdn.claude.ai"))
+        assertFalse(isAllowed("evil.hacker.com"))
     }
 }

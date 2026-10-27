@@ -7,7 +7,7 @@
 ## 1. Общие Сведения о Проекте (Project Overview)
 
 - **Название приложения:** `ClaudeCage` (пакет: `com.example.claudecageand`).
-- **Текущая версия:** `1.1 (Build 2)` • **Hardening:** `Stage 10: Zero-Trust Hardening & Code Review Remediation`.
+- **Текущая версия:** `1.1 (Build 2)` • **Hardening:** `Stage 10.1: Zero-Trust Hardening & Production Hotfix`.
 - **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36).
 - **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37).
 - **Целевой VPN-клиент:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray).
@@ -29,17 +29,17 @@
    - Применяется `.removeImplicitRules()` в `ProxyConfig.Builder()`, предотвращающий автоматический обход прокси Chromium для `localhost` и `127.0.0.1`.
    - Google Safe Browsing отключён через `WebSettingsCompat.setSafeBrowsingEnabled(settings, false)`, исключая сторонние внепрокси-запросы Chromium к серверам Google.
 3. **Белый список назначений и фильтр приватных IP (Destination Allowlist & Private IP Filter):**
-   - Доступ через SOCKS5 шлюз разрешён исключительно к доменам из белого списка `ALLOWED_DOMAIN_SUFFIXES` (`claude.ai`, `anthropic.com`, `intercom.io`, `statsig.com`, `browserleaks.com`, `google.com`, `gstatic.com`, `googleapis.com`, `appleid.apple.com`). Все сторонние домены мгновенно отклоняются `0x05 (Connection Refused)`.
+   - Доступ через SOCKS5 шлюз разрешён исключительно к доменам из белого списка `ALLOWED_DOMAIN_SUFFIXES` (24 домена: `claude.ai`, `anthropic.com`, `claude.com`, `cloudflare.com`, `hcaptcha.com`, `stripe.com`, `stripe.network`, `intercom.io`, `intercomcdn.com`, `statsig.com`, `statsigapi.net`, `datadoghq.com`, `sentry.io`, `google.com`, `gstatic.com`, `googleapis.com`, `googleusercontent.com`, `youtube.com`, `apple.com`, `appleid.apple.com`, `browserleaks.com`, `browserleaks.net`, `browserleaks.org`, `ripe.net`). Все сторонние домены мгновенно отклоняются `0x05 (Connection Refused)`.
    - Прямые IPv4-подключения фильтруются через `isForbiddenIp`: запрещены loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), RFC 1918 приватные подсети (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) и IP самого tun-интерфейса.
 4. **Строгая привязка сокетов к VPN и поколенческий Kill-Switch (Generational Socket Binding):**
    - Состояние `VpnTunnelState.Connected` строго хранит non-null `network: Network` и монотонный счётчик `generation: Long`.
    - При подключении VPN вызывается `connectivityManager.bindProcessToNetwork(network)` (и `bindProcessToNetwork(null)` при отключении).
-   - Каждый исходящий TCP-сокет (`VpnGatekeeperProxy` и `TunnelDnsResolver`) привязывается в строгом порядке:
-     1. `network.bindSocket(socket)` — обязательный системный вызов ядра. При любой ошибке соединение немедленно прерывается (никакого silent fail-open).
-     2. `socket.bind(InetSocketAddress(tunIpv4, 0))` — привязка локального IP источника к IPv4 адресу tun-адаптера.
+   - Исходящий TCP-сокет привязывается к сетевому стеку туннеля:
+     1. `network.bindSocket(socket)` — с защитой от OS permission ошибок на One UI 9 / Samsung VPN Network.
+     2. `socket.bind(InetSocketAddress(tunIpv4, 0))` — обязательная привязка локального IP источника к IPv4 адресу tun-адаптера с верификацией `outbound.localAddress == tunIpv4`.
    - Исходящие сокеты регистрируются с номером поколения: `outboundSockets: ConcurrentHashMap<Socket, Long>`.
    - Синхронный слушатель `TunnelListener` вызывается под блокировкой `stateLock` при любом изменении VPN:
-     - При падении VPN мгновенно закрывает дескрипторы всех активных клиентских и серверных сокетов.
+     - При падении VPN мгновенно закрывает дескрипторы всех активных клиентских и серверных сокетов и вызывает `dnsResolver.clearCache(clearStale = false)`, сохраняя stale-кэш для быстрого Doze wake-up.
      - При VPN handover (смене tun/NetID) мгновенно закрывает сокеты устаревших поколений (`gen < currentGeneration`).
 5. **Выделенный пул потоков для передачи трафика (Relay Anti-Starvation):**
    - Двунаправленный пайпинг данных (`relayTraffic`) работает на выделенном пуле потоков `relayExecutor = Executors.newCachedThreadPool { ... }.asCoroutineDispatcher()`.
@@ -70,8 +70,8 @@
    - JVM: `TimeZone.setDefault("Europe/Amsterdam")`, `Locale.setDefault(Locale.US)`.
    - Android OS: `LocaleList.setDefault(LocaleList(Locale.US))` (на API 24+).
    - Document-Start JS: WebRTC полностью ампутирован (`RTCPeerConnection = null`).
-   - **Offscreen Canvas Farbling:** при вызовах `toDataURL` и `toBlob` для наложения детерминированного шума создаётся временный оффскрин-холст (`document.createElement('canvas')`), предотвращая перманентное разрушение исходного холста страницы и визуальные артефакты.
-   - **`Function.prototype.toString` Cloaking:** использование `WeakMap` маскирует переопределённые JS-методы под нативные (`function name() { [native code] }`).
+   - **Offscreen Canvas Farbling & Alpha Preservation:** при вызовах `getImageData`, `toDataURL` и `toBlob` сканируется массив пикселей в поисках первого непрозрачного пикселя (`alpha > 0`) для исключения обнуления RGB при PNG-премультипликации. В `toDataURL` и `toBlob` для наложения детерминированного шума создаётся временный оффскрин-холст (`document.createElement('canvas')`), сохраняя оригинальный холст страницы нетронутым.
+   - **`Function.prototype.toString` Cloaking:** регистрация `Function.prototype.toString` в `WeakMap` гарантирует, что `Function.prototype.toString.toString()` возвращает `function toString() { [native code] }`. Все переопределённые методы `Date` и `Intl` замаскированы под нативные.
    - Блокировка TTS-голосов на уровне `window.speechSynthesis` и `SpeechSynthesis.prototype.getVoices`.
    - Фиксация `Intl.*` на `en-US`, `hardwareConcurrency = 8`, `deviceMemory = 8`, `navigator.webdriver = false`, `navigator.connection.onchange = null`.
 10. **Отказоустойчивость WebView и валидация Origin:**

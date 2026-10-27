@@ -696,12 +696,21 @@ class TunnelDnsResolver(
                 return DnsResponse(address = null, isNoData = true, rcode = 0)
             }
 
-            // Skip questions
+            // Verify questions and QNAME
             for (i in 0 until qdCount) {
-                skipDnsName(buffer)
+                val qName = readDnsName(buffer, responseBytes)
                 if (buffer.remaining() < 4) return DnsResponse(isError = true)
                 buffer.short // QTYPE
                 buffer.short // QCLASS
+
+                if (expectedDomain != null && i == 0) {
+                    val normalizedExpected = expectedDomain.trim().trimEnd('.').lowercase(Locale.ROOT)
+                    val normalizedQname = qName?.trim()?.trimEnd('.')?.lowercase(Locale.ROOT)
+                    if (normalizedQname != normalizedExpected) {
+                        Log.w(TAG, "DNS QNAME mismatch: expected '$normalizedExpected', got '$normalizedQname'")
+                        return DnsResponse(isError = true)
+                    }
+                }
             }
 
             val aRecords = mutableListOf<Inet4Address>()
@@ -737,6 +746,41 @@ class TunnelDnsResolver(
             } else {
                 DnsResponse(address = null, isNoData = true, rcode = 0)
             }
+        }
+
+        private fun readDnsName(buffer: ByteBuffer, responseBytes: ByteArray): String? {
+            val sb = StringBuilder()
+            var jumped = false
+            var jumpPos = -1
+            var currentPos = buffer.position()
+            var loops = 0
+            val maxLoops = 128
+
+            while (loops++ < maxLoops) {
+                if (currentPos >= responseBytes.size) return null
+                val len = responseBytes[currentPos].toInt() and 0xFF
+                if (len == 0) {
+                    currentPos++
+                    break
+                }
+                if ((len and 0xC0) == 0xC0) {
+                    if (currentPos + 1 >= responseBytes.size) return null
+                    val offset = ((len and 0x3F) shl 8) or (responseBytes[currentPos + 1].toInt() and 0xFF)
+                    if (!jumped) {
+                        jumpPos = currentPos + 2
+                        jumped = true
+                    }
+                    currentPos = offset
+                } else {
+                    currentPos++
+                    if (currentPos + len > responseBytes.size) return null
+                    if (sb.isNotEmpty()) sb.append('.')
+                    sb.append(String(responseBytes, currentPos, len, Charsets.US_ASCII))
+                    currentPos += len
+                }
+            }
+            buffer.position(if (jumped) jumpPos else currentPos)
+            return sb.toString()
         }
 
         private fun skipDnsName(buffer: ByteBuffer) {
@@ -888,7 +932,7 @@ class VpnGatekeeperProxy(
             }
             is VpnTunnelState.Disconnected -> {
                 closeAllActiveSockets()
-                dnsResolver.clearCache()
+                dnsResolver.clearCache(clearStale = false)
             }
         }
     }
@@ -1216,11 +1260,23 @@ class VpnGatekeeperProxy(
 
             // --- Step 4: Bind Outbound Socket to VPN ---
             try {
-                // Critical Zero-Trust Fix: Android Network binding is mandatory
-                currentTunnelState.network.bindSocket(outbound)
+                // Resilient Android Network binding (handles third-party VPN permission quirks on One UI 9)
+                try {
+                    currentTunnelState.network.bindSocket(outbound)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Network.bindSocket non-fatal warning on VPN network: ${e.message}")
+                    auditLogger?.log(
+                        LogCategory.PROXY,
+                        LogLevel.WARN,
+                        "Network.bindSocket warning: ${e.message}"
+                    )
+                }
 
                 // Kernel-level fail-closed enforcement: bind socket to tunnel's local IPv4
                 outbound.bind(InetSocketAddress(currentTunnelState.tunIpv4, 0))
+                if (outbound.localAddress != currentTunnelState.tunIpv4) {
+                    throw IOException("Outbound socket localAddress ${outbound.localAddress} != tunIpv4 ${currentTunnelState.tunIpv4}")
+                }
 
                 // Check again right before TCP SYN to defeat any microsecond races
                 val verifiedTunnel = vpnStateMonitor.getCurrentTunnelState()
@@ -1372,13 +1428,28 @@ class VpnGatekeeperProxy(
         val ALLOWED_DOMAIN_SUFFIXES = setOf(
             "claude.ai",
             "anthropic.com",
+            "claude.com",
+            "cloudflare.com",
+            "hcaptcha.com",
+            "stripe.com",
+            "stripe.network",
             "intercom.io",
+            "intercomcdn.com",
             "statsig.com",
-            "browserleaks.com",
+            "statsigapi.net",
+            "datadoghq.com",
+            "sentry.io",
             "google.com",
             "gstatic.com",
             "googleapis.com",
-            "appleid.apple.com"
+            "googleusercontent.com",
+            "youtube.com",
+            "apple.com",
+            "appleid.apple.com",
+            "browserleaks.com",
+            "browserleaks.net",
+            "browserleaks.org",
+            "ripe.net"
         )
     }
 }
@@ -3656,11 +3727,23 @@ object AntiFingerprintHardener {
             try {
                 const NOISE_OFFSET = $noiseOffset;
 
+                const applyNoise = (data) => {
+                    if (!data || data.length < 4) return;
+                    let targetIdx = 0;
+                    for (let i = 0; i < data.length; i += 4) {
+                        if (data[i + 3] > 0) {
+                            targetIdx = i;
+                            break;
+                        }
+                    }
+                    data[targetIdx] = (data[targetIdx] + NOISE_OFFSET) % 256;
+                };
+
                 const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
                 CanvasRenderingContext2D.prototype.getImageData = cloak(function(sx, sy, sw, sh, settings) {
                     const imgData = origGetImageData.call(this, sx, sy, sw, sh, settings);
-                    if (imgData && imgData.data && imgData.data.length >= 4) {
-                        imgData.data[0] = (imgData.data[0] + NOISE_OFFSET) % 256;
+                    if (imgData && imgData.data) {
+                        applyNoise(imgData.data);
                     }
                     return imgData;
                 }, 'getImageData');
@@ -3675,10 +3758,12 @@ object AntiFingerprintHardener {
                             const offCtx = offscreen.getContext('2d');
                             if (offCtx) {
                                 offCtx.drawImage(this, 0, 0);
-                                const pixel = origGetImageData.call(offCtx, 0, 0, 1, 1);
-                                if (pixel && pixel.data && pixel.data.length >= 4) {
-                                    pixel.data[0] = (pixel.data[0] + NOISE_OFFSET) % 256;
-                                    offCtx.putImageData(pixel, 0, 0);
+                                const sampleW = Math.min(this.width, 32);
+                                const sampleH = Math.min(this.height, 32);
+                                const sample = origGetImageData.call(offCtx, 0, 0, sampleW, sampleH);
+                                if (sample && sample.data) {
+                                    applyNoise(sample.data);
+                                    offCtx.putImageData(sample, 0, 0);
                                 }
                                 return origToDataURL.call(offscreen, type, encoderOptions);
                             }
@@ -3697,10 +3782,12 @@ object AntiFingerprintHardener {
                             const offCtx = offscreen.getContext('2d');
                             if (offCtx) {
                                 offCtx.drawImage(this, 0, 0);
-                                const pixel = origGetImageData.call(offCtx, 0, 0, 1, 1);
-                                if (pixel && pixel.data && pixel.data.length >= 4) {
-                                    pixel.data[0] = (pixel.data[0] + NOISE_OFFSET) % 256;
-                                    offCtx.putImageData(pixel, 0, 0);
+                                const sampleW = Math.min(this.width, 32);
+                                const sampleH = Math.min(this.height, 32);
+                                const sample = origGetImageData.call(offCtx, 0, 0, sampleW, sampleH);
+                                if (sample && sample.data) {
+                                    applyNoise(sample.data);
+                                    offCtx.putImageData(sample, 0, 0);
                                 }
                                 return origToBlob.call(offscreen, callback, type, quality);
                             }
@@ -3724,6 +3811,7 @@ object AntiFingerprintHardener {
                 }
                 return origToString.call(this);
             };
+            nativeMap.set(Function.prototype.toString, 'toString');
             const cloak = (fn, name) => {
                 try {
                     nativeMap.set(fn, name);
@@ -3802,36 +3890,36 @@ object AntiFingerprintHardener {
             };
 
             try {
-                Date.prototype.getTimezoneOffset = function() {
+                Date.prototype.getTimezoneOffset = cloak(function() {
                     return computeAmsterdamOffset(this);
-                };
+                }, 'getTimezoneOffset');
             } catch (e) {}
 
             try {
                 const OrigDTF = Intl.DateTimeFormat;
-                const ProxyDTF = function(locales, options) {
+                const ProxyDTF = cloak(function(locales, options) {
                     const opts = Object.assign({}, options);
                     if (!opts.timeZone) {
                         opts.timeZone = TARGET_TIMEZONE;
                     }
                     return new OrigDTF(locales || 'en-US', opts);
-                };
+                }, 'DateTimeFormat');
                 ProxyDTF.prototype = OrigDTF.prototype;
                 ProxyDTF.supportedLocalesOf = OrigDTF.supportedLocalesOf;
 
                 const origResolvedOptions = OrigDTF.prototype.resolvedOptions;
-                OrigDTF.prototype.resolvedOptions = function() {
+                OrigDTF.prototype.resolvedOptions = cloak(function() {
                     const res = origResolvedOptions.call(this);
                     res.timeZone = TARGET_TIMEZONE;
                     return res;
-                };
+                }, 'resolvedOptions');
 
                 Intl.DateTimeFormat = ProxyDTF;
             } catch (e) {}
 
             // 5. Date string representations in Europe/Amsterdam (en-US)
             try {
-                Date.prototype.toString = function() {
+                Date.prototype.toString = cloak(function() {
                     if (isNaN(this.getTime())) return 'Invalid Date';
                     try {
                         const dtf = new OrigDTF('en-US', {
@@ -3857,9 +3945,9 @@ object AntiFingerprintHardener {
                     } catch (err) {
                         return 'Invalid Date';
                     }
-                };
+                }, 'toString');
 
-                Date.prototype.toTimeString = function() {
+                Date.prototype.toTimeString = cloak(function() {
                     if (isNaN(this.getTime())) return 'Invalid Date';
                     try {
                         const dtf = new OrigDTF('en-US', {
@@ -3881,28 +3969,28 @@ object AntiFingerprintHardener {
                     } catch (err) {
                         return 'Invalid Date';
                     }
-                };
+                }, 'toTimeString');
 
                 const origToLocaleString = Date.prototype.toLocaleString;
-                Date.prototype.toLocaleString = function(locales, options) {
+                Date.prototype.toLocaleString = cloak(function(locales, options) {
                     const opts = Object.assign({}, options);
                     if (!opts.timeZone) opts.timeZone = TARGET_TIMEZONE;
                     return origToLocaleString.call(this, locales || 'en-US', opts);
-                };
+                }, 'toLocaleString');
 
                 const origToLocaleDateString = Date.prototype.toLocaleDateString;
-                Date.prototype.toLocaleDateString = function(locales, options) {
+                Date.prototype.toLocaleDateString = cloak(function(locales, options) {
                     const opts = Object.assign({}, options);
                     if (!opts.timeZone) opts.timeZone = TARGET_TIMEZONE;
                     return origToLocaleDateString.call(this, locales || 'en-US', opts);
-                };
+                }, 'toLocaleDateString');
 
                 const origToLocaleTimeString = Date.prototype.toLocaleTimeString;
-                Date.prototype.toLocaleTimeString = function(locales, options) {
+                Date.prototype.toLocaleTimeString = cloak(function(locales, options) {
                     const opts = Object.assign({}, options);
                     if (!opts.timeZone) opts.timeZone = TARGET_TIMEZONE;
                     return origToLocaleTimeString.call(this, locales || 'en-US', opts);
-                };
+                }, 'toLocaleTimeString');
             } catch (e) {}
 
             // 6. Deterministic Hardware Concurrency & Device Memory Spoofing
@@ -3935,11 +4023,11 @@ object AntiFingerprintHardener {
                 const lockLocale = (proto) => {
                     if (proto && proto.resolvedOptions) {
                         const orig = proto.resolvedOptions;
-                        proto.resolvedOptions = function() {
+                        proto.resolvedOptions = cloak(function() {
                             const res = orig.call(this);
                             if (res) res.locale = 'en-US';
                             return res;
-                        };
+                        }, 'resolvedOptions');
                     }
                 };
                 if (window.Intl) {
@@ -4983,7 +5071,7 @@ dependencies {
 ## 1. Общие Сведения о Проекте (Project Overview)
 
 - **Название приложения:** `ClaudeCage` (пакет: `com.example.claudecageand`).
-- **Текущая версия:** `1.1 (Build 2)` • **Hardening:** `Stage 10: Zero-Trust Hardening & Code Review Remediation`.
+- **Текущая версия:** `1.1 (Build 2)` • **Hardening:** `Stage 10.1: Zero-Trust Hardening & Production Hotfix`.
 - **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36).
 - **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37).
 - **Целевой VPN-клиент:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray).
@@ -5005,17 +5093,17 @@ dependencies {
    - Применяется `.removeImplicitRules()` в `ProxyConfig.Builder()`, предотвращающий автоматический обход прокси Chromium для `localhost` и `127.0.0.1`.
    - Google Safe Browsing отключён через `WebSettingsCompat.setSafeBrowsingEnabled(settings, false)`, исключая сторонние внепрокси-запросы Chromium к серверам Google.
 3. **Белый список назначений и фильтр приватных IP (Destination Allowlist & Private IP Filter):**
-   - Доступ через SOCKS5 шлюз разрешён исключительно к доменам из белого списка `ALLOWED_DOMAIN_SUFFIXES` (`claude.ai`, `anthropic.com`, `intercom.io`, `statsig.com`, `browserleaks.com`, `google.com`, `gstatic.com`, `googleapis.com`, `appleid.apple.com`). Все сторонние домены мгновенно отклоняются `0x05 (Connection Refused)`.
+   - Доступ через SOCKS5 шлюз разрешён исключительно к доменам из белого списка `ALLOWED_DOMAIN_SUFFIXES` (24 домена: `claude.ai`, `anthropic.com`, `claude.com`, `cloudflare.com`, `hcaptcha.com`, `stripe.com`, `stripe.network`, `intercom.io`, `intercomcdn.com`, `statsig.com`, `statsigapi.net`, `datadoghq.com`, `sentry.io`, `google.com`, `gstatic.com`, `googleapis.com`, `googleusercontent.com`, `youtube.com`, `apple.com`, `appleid.apple.com`, `browserleaks.com`, `browserleaks.net`, `browserleaks.org`, `ripe.net`). Все сторонние домены мгновенно отклоняются `0x05 (Connection Refused)`.
    - Прямые IPv4-подключения фильтруются через `isForbiddenIp`: запрещены loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), RFC 1918 приватные подсети (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) и IP самого tun-интерфейса.
 4. **Строгая привязка сокетов к VPN и поколенческий Kill-Switch (Generational Socket Binding):**
    - Состояние `VpnTunnelState.Connected` строго хранит non-null `network: Network` и монотонный счётчик `generation: Long`.
    - При подключении VPN вызывается `connectivityManager.bindProcessToNetwork(network)` (и `bindProcessToNetwork(null)` при отключении).
-   - Каждый исходящий TCP-сокет (`VpnGatekeeperProxy` и `TunnelDnsResolver`) привязывается в строгом порядке:
-     1. `network.bindSocket(socket)` — обязательный системный вызов ядра. При любой ошибке соединение немедленно прерывается (никакого silent fail-open).
-     2. `socket.bind(InetSocketAddress(tunIpv4, 0))` — привязка локального IP источника к IPv4 адресу tun-адаптера.
+   - Исходящий TCP-сокет привязывается к сетевому стеку туннеля:
+     1. `network.bindSocket(socket)` — с защитой от OS permission ошибок на One UI 9 / Samsung VPN Network.
+     2. `socket.bind(InetSocketAddress(tunIpv4, 0))` — обязательная привязка локального IP источника к IPv4 адресу tun-адаптера с верификацией `outbound.localAddress == tunIpv4`.
    - Исходящие сокеты регистрируются с номером поколения: `outboundSockets: ConcurrentHashMap<Socket, Long>`.
    - Синхронный слушатель `TunnelListener` вызывается под блокировкой `stateLock` при любом изменении VPN:
-     - При падении VPN мгновенно закрывает дескрипторы всех активных клиентских и серверных сокетов.
+     - При падении VPN мгновенно закрывает дескрипторы всех активных клиентских и серверных сокетов и вызывает `dnsResolver.clearCache(clearStale = false)`, сохраняя stale-кэш для быстрого Doze wake-up.
      - При VPN handover (смене tun/NetID) мгновенно закрывает сокеты устаревших поколений (`gen < currentGeneration`).
 5. **Выделенный пул потоков для передачи трафика (Relay Anti-Starvation):**
    - Двунаправленный пайпинг данных (`relayTraffic`) работает на выделенном пуле потоков `relayExecutor = Executors.newCachedThreadPool { ... }.asCoroutineDispatcher()`.
@@ -5046,8 +5134,8 @@ dependencies {
    - JVM: `TimeZone.setDefault("Europe/Amsterdam")`, `Locale.setDefault(Locale.US)`.
    - Android OS: `LocaleList.setDefault(LocaleList(Locale.US))` (на API 24+).
    - Document-Start JS: WebRTC полностью ампутирован (`RTCPeerConnection = null`).
-   - **Offscreen Canvas Farbling:** при вызовах `toDataURL` и `toBlob` для наложения детерминированного шума создаётся временный оффскрин-холст (`document.createElement('canvas')`), предотвращая перманентное разрушение исходного холста страницы и визуальные артефакты.
-   - **`Function.prototype.toString` Cloaking:** использование `WeakMap` маскирует переопределённые JS-методы под нативные (`function name() { [native code] }`).
+   - **Offscreen Canvas Farbling & Alpha Preservation:** при вызовах `getImageData`, `toDataURL` и `toBlob` сканируется массив пикселей в поисках первого непрозрачного пикселя (`alpha > 0`) для исключения обнуления RGB при PNG-премультипликации. В `toDataURL` и `toBlob` для наложения детерминированного шума создаётся временный оффскрин-холст (`document.createElement('canvas')`), сохраняя оригинальный холст страницы нетронутым.
+   - **`Function.prototype.toString` Cloaking:** регистрация `Function.prototype.toString` в `WeakMap` гарантирует, что `Function.prototype.toString.toString()` возвращает `function toString() { [native code] }`. Все переопределённые методы `Date` и `Intl` замаскированы под нативные.
    - Блокировка TTS-голосов на уровне `window.speechSynthesis` и `SpeechSynthesis.prototype.getVoices`.
    - Фиксация `Intl.*` на `en-US`, `hardwareConcurrency = 8`, `deviceMemory = 8`, `navigator.webdriver = false`, `navigator.connection.onchange = null`.
 10. **Отказоустойчивость WebView и валидация Origin:**

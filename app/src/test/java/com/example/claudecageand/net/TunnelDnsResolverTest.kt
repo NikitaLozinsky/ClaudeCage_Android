@@ -9,6 +9,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
 import java.net.Inet4Address
+import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -280,5 +281,69 @@ class TunnelDnsResolverTest {
         assertNotNull(parsed.address)
         val picked = parsed.address!!.hostAddress
         assertTrue(picked == "104.18.2.3" || picked == "104.18.3.4")
+    }
+
+    @Test
+    fun parseTcpDnsResponse_verifiesQname() {
+        val queryId = 0xABCD
+        val out = ByteArrayOutputStream()
+        val header = ByteBuffer.allocate(12).order(ByteOrder.BIG_ENDIAN)
+        header.putShort(queryId.toShort())
+        header.putShort(0x8180.toShort())
+        header.putShort(1.toShort())      // QDCOUNT = 1
+        header.putShort(1.toShort())      // ANCOUNT = 1
+        header.putShort(0.toShort())
+        header.putShort(0.toShort())
+        out.write(header.array())
+
+        // Question: claude.ai IN A
+        out.write(byteArrayOf(6, 'c'.code.toByte(), 'l'.code.toByte(), 'a'.code.toByte(), 'u'.code.toByte(), 'd'.code.toByte(), 'e'.code.toByte()))
+        out.write(byteArrayOf(2, 'a'.code.toByte(), 'i'.code.toByte()))
+        out.write(0)
+        val qtail = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
+        qtail.putShort(1.toShort())
+        qtail.putShort(1.toShort())
+        out.write(qtail.array())
+
+        // Answer
+        out.write(byteArrayOf(0xC0.toByte(), 0x0C.toByte()))
+        val atail = ByteBuffer.allocate(10).order(ByteOrder.BIG_ENDIAN)
+        atail.putShort(1.toShort())
+        atail.putShort(1.toShort())
+        atail.putInt(300)
+        atail.putShort(4.toShort())
+        out.write(atail.array())
+        out.write(byteArrayOf(104, 18, 2, 3))
+
+        val responseBytes = out.toByteArray()
+
+        // Correct domain matches
+        val match = TunnelDnsResolver.parseTcpDnsResponse(responseBytes, queryId, "claude.ai")
+        assertFalse(match.isError)
+        assertEquals(InetAddress.getByAddress(byteArrayOf(104, 18, 2, 3)), match.address)
+
+        // Case-insensitive & trailing dot matches
+        val matchCase = TunnelDnsResolver.parseTcpDnsResponse(responseBytes, queryId, "CLAUDE.AI.")
+        assertFalse(matchCase.isError)
+
+        // Mismatched domain fails with isError = true
+        val mismatch = TunnelDnsResolver.parseTcpDnsResponse(responseBytes, queryId, "attacker.com")
+        assertTrue(mismatch.isError)
+    }
+
+    @Test
+    fun clearCache_preservesStaleCacheWhenRequested() {
+        val resolver = TunnelDnsResolver()
+        val ip = InetAddress.getByAddress(byteArrayOf(104, 18, 2, 3)) as Inet4Address
+        resolver.putStaleEntryForTesting("claude.ai", ip)
+        assertEquals(1, resolver.staleCacheSize)
+
+        // Clear without clearing stale
+        resolver.clearCache(clearStale = false)
+        assertEquals(1, resolver.staleCacheSize)
+
+        // Full clear
+        resolver.clearCache(clearStale = true)
+        assertEquals(0, resolver.staleCacheSize)
     }
 }

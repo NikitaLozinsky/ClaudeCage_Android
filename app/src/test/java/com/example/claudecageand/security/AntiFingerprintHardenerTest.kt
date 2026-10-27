@@ -85,4 +85,26 @@ class AntiFingerprintHardenerTest {
         assertTrue("TimeZone ID should be Europe/Amsterdam", TimeZone.getDefault().id == "Europe/Amsterdam")
         assertTrue("Locale should be US", Locale.getDefault() == Locale.US)
     }
+
+    @Test
+    fun documentStartJs_functionToStringCloakedAndAlphaPreserved() {
+        val js = AntiFingerprintHardener.DOCUMENT_START_JS
+
+        // Must register Function.prototype.toString in nativeMap
+        assertTrue("Must cloak Function.prototype.toString itself", js.contains("nativeMap.set(Function.prototype.toString, 'toString')"))
+
+        // Date and Intl hooks must be cloaked
+        assertTrue("Must cloak getTimezoneOffset", js.contains("'getTimezoneOffset'"))
+        assertTrue("Must cloak DateTimeFormat", js.contains("'DateTimeFormat'"))
+        assertTrue("Must cloak Date.prototype.toString", js.contains("Date.prototype.toString = cloak("))
+        assertTrue("Must cloak Date.prototype.toTimeString", js.contains("Date.prototype.toTimeString = cloak("))
+        assertTrue("Must cloak Date.prototype.toLocaleString", js.contains("Date.prototype.toLocaleString = cloak("))
+        assertTrue("Must cloak Date.prototype.toLocaleDateString", js.contains("Date.prototype.toLocaleDateString = cloak("))
+        assertTrue("Must cloak Date.prototype.toLocaleTimeString", js.contains("Date.prototype.toLocaleTimeString = cloak("))
+        assertTrue("Must cloak resolvedOptions", js.contains("'resolvedOptions'"))
+
+        // Non-transparent canvas noise scan
+        assertTrue("Must scan for non-transparent pixel (data[i + 3] > 0)", js.contains("data[i + 3] > 0"))
+        assertTrue("Must apply noise to targetIdx", js.contains("data[targetIdx] = (data[targetIdx] + NOISE_OFFSET) % 256"))
+    }
 }

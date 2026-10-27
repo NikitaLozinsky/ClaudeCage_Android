@@ -30,11 +30,23 @@ object AntiFingerprintHardener {
             try {
                 const NOISE_OFFSET = $noiseOffset;
 
+                const applyNoise = (data) => {
+                    if (!data || data.length < 4) return;
+                    let targetIdx = 0;
+                    for (let i = 0; i < data.length; i += 4) {
+                        if (data[i + 3] > 0) {
+                            targetIdx = i;
+                            break;
+                        }
+                    }
+                    data[targetIdx] = (data[targetIdx] + NOISE_OFFSET) % 256;
+                };
+
                 const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
                 CanvasRenderingContext2D.prototype.getImageData = cloak(function(sx, sy, sw, sh, settings) {
                     const imgData = origGetImageData.call(this, sx, sy, sw, sh, settings);
-                    if (imgData && imgData.data && imgData.data.length >= 4) {
-                        imgData.data[0] = (imgData.data[0] + NOISE_OFFSET) % 256;
+                    if (imgData && imgData.data) {
+                        applyNoise(imgData.data);
                     }
                     return imgData;
                 }, 'getImageData');
@@ -49,10 +61,12 @@ object AntiFingerprintHardener {
                             const offCtx = offscreen.getContext('2d');
                             if (offCtx) {
                                 offCtx.drawImage(this, 0, 0);
-                                const pixel = origGetImageData.call(offCtx, 0, 0, 1, 1);
-                                if (pixel && pixel.data && pixel.data.length >= 4) {
-                                    pixel.data[0] = (pixel.data[0] + NOISE_OFFSET) % 256;
-                                    offCtx.putImageData(pixel, 0, 0);
+                                const sampleW = Math.min(this.width, 32);
+                                const sampleH = Math.min(this.height, 32);
+                                const sample = origGetImageData.call(offCtx, 0, 0, sampleW, sampleH);
+                                if (sample && sample.data) {
+                                    applyNoise(sample.data);
+                                    offCtx.putImageData(sample, 0, 0);
                                 }
                                 return origToDataURL.call(offscreen, type, encoderOptions);
                             }
@@ -71,10 +85,12 @@ object AntiFingerprintHardener {
                             const offCtx = offscreen.getContext('2d');
                             if (offCtx) {
                                 offCtx.drawImage(this, 0, 0);
-                                const pixel = origGetImageData.call(offCtx, 0, 0, 1, 1);
-                                if (pixel && pixel.data && pixel.data.length >= 4) {
-                                    pixel.data[0] = (pixel.data[0] + NOISE_OFFSET) % 256;
-                                    offCtx.putImageData(pixel, 0, 0);
+                                const sampleW = Math.min(this.width, 32);
+                                const sampleH = Math.min(this.height, 32);
+                                const sample = origGetImageData.call(offCtx, 0, 0, sampleW, sampleH);
+                                if (sample && sample.data) {
+                                    applyNoise(sample.data);
+                                    offCtx.putImageData(sample, 0, 0);
                                 }
                                 return origToBlob.call(offscreen, callback, type, quality);
                             }
@@ -98,6 +114,7 @@ object AntiFingerprintHardener {
                 }
                 return origToString.call(this);
             };
+            nativeMap.set(Function.prototype.toString, 'toString');
             const cloak = (fn, name) => {
                 try {
                     nativeMap.set(fn, name);
@@ -176,36 +193,36 @@ object AntiFingerprintHardener {
             };
 
             try {
-                Date.prototype.getTimezoneOffset = function() {
+                Date.prototype.getTimezoneOffset = cloak(function() {
                     return computeAmsterdamOffset(this);
-                };
+                }, 'getTimezoneOffset');
             } catch (e) {}
 
             try {
                 const OrigDTF = Intl.DateTimeFormat;
-                const ProxyDTF = function(locales, options) {
+                const ProxyDTF = cloak(function(locales, options) {
                     const opts = Object.assign({}, options);
                     if (!opts.timeZone) {
                         opts.timeZone = TARGET_TIMEZONE;
                     }
                     return new OrigDTF(locales || 'en-US', opts);
-                };
+                }, 'DateTimeFormat');
                 ProxyDTF.prototype = OrigDTF.prototype;
                 ProxyDTF.supportedLocalesOf = OrigDTF.supportedLocalesOf;
 
                 const origResolvedOptions = OrigDTF.prototype.resolvedOptions;
-                OrigDTF.prototype.resolvedOptions = function() {
+                OrigDTF.prototype.resolvedOptions = cloak(function() {
                     const res = origResolvedOptions.call(this);
                     res.timeZone = TARGET_TIMEZONE;
                     return res;
-                };
+                }, 'resolvedOptions');
 
                 Intl.DateTimeFormat = ProxyDTF;
             } catch (e) {}
 
             // 5. Date string representations in Europe/Amsterdam (en-US)
             try {
-                Date.prototype.toString = function() {
+                Date.prototype.toString = cloak(function() {
                     if (isNaN(this.getTime())) return 'Invalid Date';
                     try {
                         const dtf = new OrigDTF('en-US', {
@@ -231,9 +248,9 @@ object AntiFingerprintHardener {
                     } catch (err) {
                         return 'Invalid Date';
                     }
-                };
+                }, 'toString');
 
-                Date.prototype.toTimeString = function() {
+                Date.prototype.toTimeString = cloak(function() {
                     if (isNaN(this.getTime())) return 'Invalid Date';
                     try {
                         const dtf = new OrigDTF('en-US', {
@@ -255,28 +272,28 @@ object AntiFingerprintHardener {
                     } catch (err) {
                         return 'Invalid Date';
                     }
-                };
+                }, 'toTimeString');
 
                 const origToLocaleString = Date.prototype.toLocaleString;
-                Date.prototype.toLocaleString = function(locales, options) {
+                Date.prototype.toLocaleString = cloak(function(locales, options) {
                     const opts = Object.assign({}, options);
                     if (!opts.timeZone) opts.timeZone = TARGET_TIMEZONE;
                     return origToLocaleString.call(this, locales || 'en-US', opts);
-                };
+                }, 'toLocaleString');
 
                 const origToLocaleDateString = Date.prototype.toLocaleDateString;
-                Date.prototype.toLocaleDateString = function(locales, options) {
+                Date.prototype.toLocaleDateString = cloak(function(locales, options) {
                     const opts = Object.assign({}, options);
                     if (!opts.timeZone) opts.timeZone = TARGET_TIMEZONE;
                     return origToLocaleDateString.call(this, locales || 'en-US', opts);
-                };
+                }, 'toLocaleDateString');
 
                 const origToLocaleTimeString = Date.prototype.toLocaleTimeString;
-                Date.prototype.toLocaleTimeString = function(locales, options) {
+                Date.prototype.toLocaleTimeString = cloak(function(locales, options) {
                     const opts = Object.assign({}, options);
                     if (!opts.timeZone) opts.timeZone = TARGET_TIMEZONE;
                     return origToLocaleTimeString.call(this, locales || 'en-US', opts);
-                };
+                }, 'toLocaleTimeString');
             } catch (e) {}
 
             // 6. Deterministic Hardware Concurrency & Device Memory Spoofing
@@ -309,11 +326,11 @@ object AntiFingerprintHardener {
                 const lockLocale = (proto) => {
                     if (proto && proto.resolvedOptions) {
                         const orig = proto.resolvedOptions;
-                        proto.resolvedOptions = function() {
+                        proto.resolvedOptions = cloak(function() {
                             const res = orig.call(this);
                             if (res) res.locale = 'en-US';
                             return res;
-                        };
+                        }, 'resolvedOptions');
                     }
                 };
                 if (window.Intl) {

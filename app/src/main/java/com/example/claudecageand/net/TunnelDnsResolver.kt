@@ -492,12 +492,21 @@ class TunnelDnsResolver(
                 return DnsResponse(address = null, isNoData = true, rcode = 0)
             }
 
-            // Skip questions
+            // Verify questions and QNAME
             for (i in 0 until qdCount) {
-                skipDnsName(buffer)
+                val qName = readDnsName(buffer, responseBytes)
                 if (buffer.remaining() < 4) return DnsResponse(isError = true)
                 buffer.short // QTYPE
                 buffer.short // QCLASS
+
+                if (expectedDomain != null && i == 0) {
+                    val normalizedExpected = expectedDomain.trim().trimEnd('.').lowercase(Locale.ROOT)
+                    val normalizedQname = qName?.trim()?.trimEnd('.')?.lowercase(Locale.ROOT)
+                    if (normalizedQname != normalizedExpected) {
+                        Log.w(TAG, "DNS QNAME mismatch: expected '$normalizedExpected', got '$normalizedQname'")
+                        return DnsResponse(isError = true)
+                    }
+                }
             }
 
             val aRecords = mutableListOf<Inet4Address>()
@@ -533,6 +542,41 @@ class TunnelDnsResolver(
             } else {
                 DnsResponse(address = null, isNoData = true, rcode = 0)
             }
+        }
+
+        private fun readDnsName(buffer: ByteBuffer, responseBytes: ByteArray): String? {
+            val sb = StringBuilder()
+            var jumped = false
+            var jumpPos = -1
+            var currentPos = buffer.position()
+            var loops = 0
+            val maxLoops = 128
+
+            while (loops++ < maxLoops) {
+                if (currentPos >= responseBytes.size) return null
+                val len = responseBytes[currentPos].toInt() and 0xFF
+                if (len == 0) {
+                    currentPos++
+                    break
+                }
+                if ((len and 0xC0) == 0xC0) {
+                    if (currentPos + 1 >= responseBytes.size) return null
+                    val offset = ((len and 0x3F) shl 8) or (responseBytes[currentPos + 1].toInt() and 0xFF)
+                    if (!jumped) {
+                        jumpPos = currentPos + 2
+                        jumped = true
+                    }
+                    currentPos = offset
+                } else {
+                    currentPos++
+                    if (currentPos + len > responseBytes.size) return null
+                    if (sb.isNotEmpty()) sb.append('.')
+                    sb.append(String(responseBytes, currentPos, len, Charsets.US_ASCII))
+                    currentPos += len
+                }
+            }
+            buffer.position(if (jumped) jumpPos else currentPos)
+            return sb.toString()
         }
 
         private fun skipDnsName(buffer: ByteBuffer) {
