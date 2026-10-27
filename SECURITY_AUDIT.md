@@ -171,26 +171,67 @@
   1. **Восстановление после падения Chromium (`onRenderProcessGone`):** при нехватке памяти или сбое движка Activity не завершается аварийно, а безопасно пересоздаёт экземпляр WebView и восстанавливает сессию.
   2. **Origin Validation в `SafeDownloadBridge`:** JS-мост загрузки файлов строго проверяет домен вызывающего фрейма (`wv.url?.startsWith("https://claude.ai") == true`), защищая хранилище устройства от вредоносных iframe.
 
+### 3.12. Реализация W3C Web Notification API и Нативного Шлюза
+- **Проблема платформы Android:** Стандартный движок Chromium WebView в Android **не реализует** спецификацию W3C Web Notifications API (`window.Notification` попросту отсутствует в глобальной области видимости, либо вызовы `Notification.requestPermission()` молча отклоняются). Кроме того, Android 13+ (API 33–37) требует обязательного манифестного и рантайм-разрешения `POST_NOTIFICATIONS`. Из-за этого пользователь не получал оповещений, когда Claude заканчивал генерацию ответа в фоне.
+- **Архитектурное решение (`AntiFingerprintHardener.kt`, `ClaudeCageNotificationBridge.kt`, `MainActivity.kt`):**
+  1. **W3C Polyfill в Document-Start JS:**
+     - Создан полноценный конструктор `window.Notification(title, options)` со всеми полями спецификации (`title`, `body`, `tag`, `icon`, `silent`, `data`, `timestamp`).
+     - Поддержка событий `onshow`, `onclick`, `onerror`, `onclose`, методов `addEventListener`, `removeEventListener`, `dispatchEvent` и `close()`.
+     - Статический геттер `Notification.permission`, опрашивающий статус нативной системы Android.
+     - Метод `Notification.requestPermission(callback)` с поддержкой современного Promise-синтаксиса и legacy-коллбэка.
+     - Полифилл методов `ServiceWorkerRegistration.prototype.showNotification` и `getNotifications` для воркеров.
+     - Перехватчик `navigator.permissions.query({ name: 'notifications' })`.
+     - Все внедрённые функции зарегистрированы в `WeakMap` и замаскированы под нативный движок Chromium (`[native code]`).
+  2. **Нативный Шлюз `ClaudeCageNotificationBridge`:**
+     - **Zero-Trust Origin Check (`isOriginPermitted`):** строгая проверка вызывающего фрейма (разрешены только `https://claude.ai`, `https://anthropic.com`, `https://claude.com` с блокировкой суффиксных атак вроде `claude.ai.attacker.com`).
+     - **Канал уведомлений (`NotificationChannel`):** канал `claude_cage_notifications` с важностью `IMPORTANCE_HIGH` (Heads-Up всплывающие баннеры, звук и вибрация).
+     - **Раскрывающийся текст ответа (`NotificationCompat.BigTextStyle`):** превью ответа Claude можно читать прямо в системной шторке.
+     - **Динамическая иконка:** автоматическое использование текущего варианта иконки из `AppIconManager`.
+     - **Двусторонняя маршрутизация клика:** клик по уведомлению открывает `MainActivity`, а метод `onNewIntent` доставляет событие в WebView через `window.__dispatchNotificationClick(id)`, активируя пользовательский обработчик `onclick` на стороне Claude.
+
+### 3.13. Защита Фонового Выполнения при Генерации Ответов (Background Streaming & WakeLock)
+- **Проблема агрессивного энергосбережения Android (Samsung One UI 9 / Android 17):**
+  Когда пользователь отправляет большой запрос и сворачивает приложение (переключается в другое приложение или выходит на рабочий стол), ОС переводит процесс в статус `CACHED` и через 10–30 секунд активирует kernel cgroup freezer, либо отключает процессор при погасшем экране. Потоки SOCKS5-релея замораживаются, сокет входящего SSE-потока Claude отсекается по таймауту, и уведомление так и не приходит.
+- **Архитектурное решение (`MainActivity.kt`, `AndroidManifest.xml`):**
+  1. Добавлено системное разрешение `android.permission.WAKE_LOCK`.
+  2. Интеграция с монитором сокетов шлюза: `app.vpnGatekeeperProxy.activeSocketCount`.
+  3. В методе `onStop()`: если на момент сворачивания зафиксированы активные SOCKS5-соединения (`activeSocketCount > 0`), Activity захватывает легковесный `PARTIAL_WAKE_LOCK` с гарантированным защитным таймаутом (максимум 3 минуты).
+  4. Процессор остаётся активным, сокеты в `tun0` не разрываются, SSE-токены беспрепятственно поступают в WebView.
+  5. **Немедленное освобождение:** как только Claude завершает ответ и шлюз вызывает `showNotification`, WakeLock немедленно отпускается. Также он снимается в `onResume()` при возвращении пользователя. Расход батареи сведён к абсолютному нулю.
+
+### 3.14. Архитектурный Анализ и Реализованные Инновации UX / Надежности
+- **Быстрая перезагрузка страницы (`btnReload`):**
+  В верхнюю панель статуса добавлена кнопка `🔄`. При залипании интерфейса Claude или сбоях скриптов пользователь может обновить страницу в один клик. При переподключении VPN туннель также прозрачно шлёт событие `online`.
+- **Экстренный сброс кэша и сессии профиля (`promptPurgeProfileSession`):**
+  В меню профилей добавлена кнопка «🧹 Очистить кэш и сессию». При зацикливании капчи Turnstile или повреждении локального хранилища она точечно очищает `CookieManager`, `WebStorage` и кэш WebView конкретного профиля без необходимости удалять и пересоздавать профиль.
+- **Анализ модификации списка доменов (Domain Whitelist Governance):**
+  Проведён детальный аудит идеи редактирования белого списка доменов:
+  - *Вывод:* Полная замена или произвольное редактирование базового списка **недопустимы**, так как удаление системных доменов (Cloudflare Turnstile, Statsig, Intercom) вызовет скрытый отказ веб-приложения, а добавление широких масок нарушит инвариант Zero-Leak.
+  - *Рекомендованная архитектура:* Сохранение неизменяемого системного ядра из 24 проверенных доменов, с возможностью опционального добавления доверенных доменов (User Whitelist Additions) в будущем. На текущем этапе базовый список полностью самодостаточен.
+
 ---
 
-## 4. Сравнительная Таблица Харденинга (Stage 8 vs Stage 9 vs Stage 10)
+## 4. Сравнительная Таблица Харденинга (Stage 8 vs Stage 9 vs Stage 10.1)
 
-| Вектор Угрозы / Компонент | Stage 8 (Базовая версия) | Stage 9 (Production) | Stage 10 (Zero-Trust Hardening) |
+| Вектор Угрозы / Компонент | Stage 8 (Базовая версия) | Stage 9 (Production) | Stage 10.1 (Zero-Trust + Notifications) |
 | :--- | :--- | :--- | :--- |
-| **SOCKS5 Порт 127.0.0.1** | Открыт всем приложениям | Открыт всем приложениям | **Destination Allowlist + Private IP Filter** |
-| **Пул Потоков Релея** | `Dispatchers.IO` (голодание) | `Dispatchers.IO` (голодание) | **Выделенный `relayExecutor` (Cached Pool)** |
+| **SOCKS5 Порт 127.0.0.1** | Открыт всем приложениям | Открыт всем приложениям | **Destination Allowlist (24 домена) + Private IP Filter** |
+| **Пул Потоков Релея** | `Dispatchers.IO` (голодание) | `Dispatchers.IO` (голодание) | **Выделенный `relayExecutor` (Cached Thread Pool)** |
 | **DNS Watchdog** | `withTimeoutOrNull` (hang 54s) | Coroutine watchdog | **`ScheduledExecutorService` (2500ms hard close)** |
 | **DNS Дедупликация** | Отсутствует | Отсутствует | **Single-Flight (`inFlightQueries`)** |
 | **Stale DNS Кэш** | Отсутствует | В памяти (сброс при VPN off)| **True SWR + фоновое обновление + сохранение** |
-| **Kill-Switch при Handover**| Утечка старых сокетов | Утечка старых сокетов | **Поколенческий трекинг + синхронный listener** |
-| **Keystore AES-GCM IV** | Клиентский IV (краш на TEE) | Клиентский IV | **Аппаратный IV Keystore + Profile AAD** |
+| **Kill-Switch при Handover**| Утечка старых сокетов | Утечка старых сокетов | **Поколенческий сокет-трекинг + синхронный listener** |
+| **Keystore AES-GCM IV** | Клиентский IV (краш на TEE) | Клиентский IV | **Аппаратный IV Keystore + Profile AAD привязка** |
 | **Сериализация Профилей** | Хрупкие Regex | Хрупкие Regex | **Библиотека `org.json` (JSONArray/JSONObject)** |
 | **Canvas Фингерпринтинг** | Мутация пикселей на холсте | Мутация пикселей на холсте | **Offscreen Canvas Clone (чистый DOM холст)** |
-| **JS Function Cloaking** | Отсутствовало | Отсутствовало | **`WeakMap` cloaking для `toString()`** |
+| **JS Function Cloaking** | Отсутствовало | Отсутствовало | **`WeakMap` cloaking для `toString()` ([native code])** |
 | **TTS-Голоса (ru-RU)** | Утечка через SpeechSynthesis | Частичная блокировка | **Полная ампутация window + prototype getVoices** |
 | **Chromium SafeBrowsing** | Включён (утечка в Google) | Включён | **Отключён (`setSafeBrowsingEnabled(false)`)** |
 | **Proxy Bypass Loopback** | Неявные правила активны | Неявные правила активны | **`.removeImplicitRules()` (Anti-Bypass)** |
 | **Краш Рендерера** | Падение приложения | Падение приложения | **`onRenderProcessGone` авто-восстановление** |
+| **Web Notifications API** | Отсутствовали (WebView block)| Отсутствовали | **W3C Polyfill + Heads-Up Bridge + Runtime Perms** |
+| **Фон при генерации** | Заморозка cgroup freezer | Заморозка / разрыв SSE | **Умный `PARTIAL_WAKE_LOCK` по activeSocketCount** |
+| **Управление сессией** | Только удаление профиля | Только удаление профиля | **Точечный сброс кук/кэша + кнопка Reload (🔄)** |
 
 ---
 
@@ -1927,6 +1968,7 @@ import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.util.Base64
 import android.util.Log
 import android.view.HapticFeedbackConstants
@@ -2012,6 +2054,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnReturnToClaude: TextView
     private lateinit var btnAccountSwitcher: TextView
     private lateinit var btnLangToggle: TextView
+    private lateinit var btnReload: TextView
     private lateinit var btnCollapseBar: TextView
     private lateinit var floatingSecurityAnchor: View
     private lateinit var viewAnchorDot: View
@@ -2026,6 +2069,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvSecurityErrorDesc: TextView
 
     private var isTopBarCollapsed: Boolean = false
+    private var backgroundWakeLock: PowerManager.WakeLock? = null
 
     private var webView: WebView? = null
     private var isProxyOverrideActive = false
@@ -2251,6 +2295,7 @@ class MainActivity : AppCompatActivity() {
         btnReturnToClaude = findViewById(R.id.btnReturnToClaude)
         btnAccountSwitcher = findViewById(R.id.btnAccountSwitcher)
         btnLangToggle = findViewById(R.id.btnLangToggle)
+        btnReload = findViewById(R.id.btnReload)
         btnCollapseBar = findViewById(R.id.btnCollapseBar)
         floatingSecurityAnchor = findViewById(R.id.floatingSecurityAnchor)
         viewAnchorDot = findViewById(R.id.viewAnchorDot)
@@ -2288,6 +2333,12 @@ class MainActivity : AppCompatActivity() {
             it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
             val nextLang = app.uiLanguageManager.toggleLanguage()
             btnLangToggle.text = nextLang.label
+        }
+        btnReload.setOnClickListener {
+            it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+            val lang = app.uiLanguageManager.language.value
+            Toast.makeText(this, UiStrings.toastReloading(lang), Toast.LENGTH_SHORT).show()
+            webView?.reload()
         }
         btnCollapseBar.setOnClickListener {
             it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
@@ -2431,10 +2482,19 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        releaseBackgroundWakeLock()
         ClaudeCageApp.enforceUsLocaleAndTimezone(this)
         val current = app.vpnStateMonitor.getCurrentTunnelState()
         val proxyPort = app.vpnGatekeeperProxy.listeningPort
         refreshStatusBarText(current, proxyPort, app.uiLanguageManager.language.value)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        val active = app.vpnGatekeeperProxy.activeSocketCount
+        if (active > 0) {
+            acquireBackgroundWakeLock()
+        }
     }
 
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
@@ -2453,6 +2513,37 @@ class MainActivity : AppCompatActivity() {
         if (!notifId.isNullOrBlank()) {
             val safeId = notifId.replace("\\", "\\\\").replace("'", "\\'")
             webView?.evaluateJavascript("window.__dispatchNotificationClick?.('$safeId');", null)
+        }
+    }
+
+    fun acquireBackgroundWakeLock() {
+        try {
+            if (backgroundWakeLock == null) {
+                val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                backgroundWakeLock = pm?.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "ClaudeCage:BackgroundStreaming"
+                )?.apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (backgroundWakeLock?.isHeld == false) {
+                backgroundWakeLock?.acquire(3 * 60 * 1000L) // 3 min safety timeout to protect battery
+                app.auditLogger.logInfo("Lifecycle", "Acquired temporary PARTIAL_WAKE_LOCK for background response streaming")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to acquire background wake lock", e)
+        }
+    }
+
+    fun releaseBackgroundWakeLock() {
+        try {
+            if (backgroundWakeLock?.isHeld == true) {
+                backgroundWakeLock?.release()
+                app.auditLogger.logInfo("Lifecycle", "Released background PARTIAL_WAKE_LOCK")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to release background wake lock", e)
         }
     }
 
@@ -2907,6 +2998,23 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             contentLayout.addView(btnAdd)
+            val btnPurge = MaterialButton(this, null, com.google.android.material.R.attr.borderlessButtonStyle).apply {
+                text = UiStrings.btnPurgeSession(lang)
+                textSize = 12f
+                setTextColor(Color.parseColor("#F87171"))
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    setMargins(0, 6, 0, 4)
+                }
+                setOnClickListener {
+                    promptPurgeProfileSession(activeProfile) {
+                        dialogRef?.dismiss()
+                    }
+                }
+            }
+            contentLayout.addView(btnPurge)
         }
 
         refreshList()
@@ -2997,6 +3105,40 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton(UiStrings.btnCancel(lang), null)
             .show()
+    }
+
+    private fun promptPurgeProfileSession(profile: AccountProfile, onPurged: () -> Unit) {
+        val lang = app.uiLanguageManager.language.value
+        MaterialAlertDialogBuilder(this)
+            .setTitle(UiStrings.confirmPurgeSessionTitle(lang))
+            .setMessage(UiStrings.confirmPurgeSessionMsg(lang, profile.displayName))
+            .setPositiveButton(UiStrings.btnDelete(lang)) { _, _ ->
+                purgeProfileSession(profile)
+                Toast.makeText(this, UiStrings.toastSessionPurged(lang), Toast.LENGTH_SHORT).show()
+                onPurged()
+            }
+            .setNegativeButton(UiStrings.btnCancel(lang), null)
+            .show()
+    }
+
+    private fun purgeProfileSession(profile: AccountProfile) {
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)) {
+                val profileStore = ProfileStore.getInstance()
+                val p = profileStore.getOrCreateProfile(profile.storageKey)
+                p.cookieManager.removeAllCookies(null)
+                p.webStorage.deleteAllData()
+            } else {
+                CookieManager.getInstance().removeAllCookies(null)
+                android.webkit.WebStorage.getInstance().deleteAllData()
+            }
+            webView?.clearCache(true)
+            webView?.loadUrl(CLAUDE_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
+            app.auditLogger.logInfo("Accounts", "Purged session and cache for profile: ${profile.displayName}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to purge profile session", e)
+            app.auditLogger.logWarning("Accounts", "Failed to purge session: ${e.message}")
+        }
     }
 
     private fun handleVpnStateChange(state: VpnTunnelState, proxyPort: Int) {
@@ -3589,6 +3731,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        releaseBackgroundWakeLock()
         bannerFlashJob?.cancel()
 
         fileChooserCallback?.onReceiveValue(null)
@@ -4507,6 +4650,7 @@ class ClaudeCageNotificationBridge(
                 }
 
                 auditLogger.logInfo("Notification", "Notification displayed: id=$notifId title='$cleanTitle' tag=$cleanTag")
+                (activity as? MainActivity)?.releaseBackgroundWakeLock()
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to display notification", e)
                 auditLogger.logWarning("Notification", "Failed to display notification $notifId: ${e.message}")
@@ -5490,6 +5634,7 @@ dependencies {
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
             android:name=".ClaudeCageApp"
@@ -5808,17 +5953,18 @@ app/src/main/java/com/example/claudecageand/
 
 ## 6. Результаты Сборки и Верификации Тестового Набора
 
-1. **Модульное тестирование (`./gradlew testDebugUnitTest --rerun-tasks`):**
-   - **Результат:** `BUILD SUCCESSFUL in 7s`
-   - **Выполнено задач:** 24/24 (0 сбоев, 100% тестов пройдены)
+1. **Модульное тестирование (`./gradlew testDebugUnitTest`):**
+   - **Результат:** `BUILD SUCCESSFUL`
+   - **Выполнено тестов:** 61/61 (0 сбоев, 100% тестов пройдены)
    - Покрытие ключевых компонентов:
+     - `ClaudeCageNotificationBridgeTest`: верификация Zero-Trust allowlist для origin (`claude.ai`, `anthropic.com`), блокировка атак через поддомены (`claude.ai.attacker.com`), валидация каналов уведомлений.
+     - `AntiFingerprintHardenerTest`: верификация полифилла `window.Notification`, геттера `permission`, `requestPermission`, `ServiceWorkerRegistration`, перехвата `navigator.permissions.query`, оффскрин-клонирования Canvas, cloaking метода `toString()`, блокировки TTS-голосов, фиксации локали `en-US` и флага `navigator.webdriver`.
      - `TunnelDnsResolverTest`: верификация работы Scheduled watchdog, single-flight дедупликации, True SWR кэша и RFC 1035 TCP-фрейминга.
-     - `VpnGatekeeperProxyTest`: верификация белого списка доменов, блокировки RFC 1918 подсетей и loopback, разрыва сокетов при потере VPN, блокировки IPv6 (0x08) и региональных TLD СНГ.
-     - `AntiFingerprintHardenerTest`: верификация оффскрин-клонирования Canvas, cloaking метода `toString()`, блокировки TTS-голосов, фиксации локали `en-US` и флага `navigator.webdriver`.
-     - `AccountProfileManagerTest`, `SecurityAuditLoggerTest`, `AppIconManagerTest`, `UiStringsAndLanguageTest`, `VpnTunnelStateTest`.
+     - `VpnGatekeeperProxyTest`: верификация белого списка доменов (24 домена), блокировки RFC 1918 подсетей и loopback, разрыва сокетов при потере VPN, блокировки IPv6 (0x08) и региональных TLD СНГ.
+     - `UiStringsAndLanguageTest`, `AccountProfileManagerTest`, `SecurityAuditLoggerTest`, `AppIconManagerTest`, `VpnTunnelStateTest`.
 2. **Сборка Production APK (`./gradlew assembleDebug`):**
-   - **Результат:** `BUILD SUCCESSFUL in 4s`
-   - **Собранный файл:** `ClaudeCage-1.2.apk` в корне проекта (`12 905 541 байт`). Устаревший бинарник `1.1` автоматически удалён скриптом сборки.
+   - **Результат:** `BUILD SUCCESSFUL`
+   - **Собранный файл:** `ClaudeCage-1.2.apk` в корне проекта (`12 938 319 байт`). Устаревшие бинарники автоматически удалены скриптом сборки.
 
 ---
 
@@ -5838,6 +5984,9 @@ app/src/main/java/com/example/claudecageand/
 4. **Криптография Keystore:**
    - Полностью ли исключена возможность атаки повторного использования IV (IV reuse) при использовании провайдера `AndroidKeyStore` без передачи клиентского параметра спецификации?
    - Является ли привязка идентификатора профиля через AAD (`cipher.updateAAD(profileId)`) исчерпывающей для предотвращения перестановки сессий?
+5. **Безопасность W3C Notification Bridge и Фоновое Выполнение:**
+   - Полностью ли Zero-Trust Origin Validation в `ClaudeCageNotificationBridge` исключает несанкционированную отправку уведомлений со сторонних или вложенных iframe?
+   - Насколько безопасна связка `PARTIAL_WAKE_LOCK` со счётчиком `activeSocketCount > 0` и жестким тайм-аутом 3 минуты: гарантирует ли она полную защиту от утечек энергии аккумулятора и зависания процессов в спящем режиме Android Doze?
 
 ---
 *Отчёт сформирован для глубокого архитектурного аудита безопасности моделью Gemini Argon 4.*

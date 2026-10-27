@@ -112,6 +112,20 @@
             android:textStyle="bold"
             android:text="@string/diag_button_label" />
 
+        <!-- Reload WebView button -->
+        <TextView
+            android:id="@+id/btnReload"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingHorizontal="8dp"
+            android:paddingVertical="4dp"
+            android:layout_marginEnd="4dp"
+            android:background="#1F2937"
+            android:textColor="#E2E8F0"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:text="🔄" />
+
         <!-- Collapse top bar button -->
         <TextView
             android:id="@+id/btnCollapseBar"

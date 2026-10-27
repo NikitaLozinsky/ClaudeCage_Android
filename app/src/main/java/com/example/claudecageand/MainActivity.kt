@@ -12,6 +12,7 @@ import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.util.Base64
 import android.util.Log
 import android.view.HapticFeedbackConstants
@@ -97,6 +98,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnReturnToClaude: TextView
     private lateinit var btnAccountSwitcher: TextView
     private lateinit var btnLangToggle: TextView
+    private lateinit var btnReload: TextView
     private lateinit var btnCollapseBar: TextView
     private lateinit var floatingSecurityAnchor: View
     private lateinit var viewAnchorDot: View
@@ -111,6 +113,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvSecurityErrorDesc: TextView
 
     private var isTopBarCollapsed: Boolean = false
+    private var backgroundWakeLock: PowerManager.WakeLock? = null
 
     private var webView: WebView? = null
     private var isProxyOverrideActive = false
@@ -336,6 +339,7 @@ class MainActivity : AppCompatActivity() {
         btnReturnToClaude = findViewById(R.id.btnReturnToClaude)
         btnAccountSwitcher = findViewById(R.id.btnAccountSwitcher)
         btnLangToggle = findViewById(R.id.btnLangToggle)
+        btnReload = findViewById(R.id.btnReload)
         btnCollapseBar = findViewById(R.id.btnCollapseBar)
         floatingSecurityAnchor = findViewById(R.id.floatingSecurityAnchor)
         viewAnchorDot = findViewById(R.id.viewAnchorDot)
@@ -373,6 +377,12 @@ class MainActivity : AppCompatActivity() {
             it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
             val nextLang = app.uiLanguageManager.toggleLanguage()
             btnLangToggle.text = nextLang.label
+        }
+        btnReload.setOnClickListener {
+            it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+            val lang = app.uiLanguageManager.language.value
+            Toast.makeText(this, UiStrings.toastReloading(lang), Toast.LENGTH_SHORT).show()
+            webView?.reload()
         }
         btnCollapseBar.setOnClickListener {
             it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
@@ -516,10 +526,19 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        releaseBackgroundWakeLock()
         ClaudeCageApp.enforceUsLocaleAndTimezone(this)
         val current = app.vpnStateMonitor.getCurrentTunnelState()
         val proxyPort = app.vpnGatekeeperProxy.listeningPort
         refreshStatusBarText(current, proxyPort, app.uiLanguageManager.language.value)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        val active = app.vpnGatekeeperProxy.activeSocketCount
+        if (active > 0) {
+            acquireBackgroundWakeLock()
+        }
     }
 
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
@@ -538,6 +557,37 @@ class MainActivity : AppCompatActivity() {
         if (!notifId.isNullOrBlank()) {
             val safeId = notifId.replace("\\", "\\\\").replace("'", "\\'")
             webView?.evaluateJavascript("window.__dispatchNotificationClick?.('$safeId');", null)
+        }
+    }
+
+    fun acquireBackgroundWakeLock() {
+        try {
+            if (backgroundWakeLock == null) {
+                val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                backgroundWakeLock = pm?.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "ClaudeCage:BackgroundStreaming"
+                )?.apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (backgroundWakeLock?.isHeld == false) {
+                backgroundWakeLock?.acquire(3 * 60 * 1000L) // 3 min safety timeout to protect battery
+                app.auditLogger.logInfo("Lifecycle", "Acquired temporary PARTIAL_WAKE_LOCK for background response streaming")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to acquire background wake lock", e)
+        }
+    }
+
+    fun releaseBackgroundWakeLock() {
+        try {
+            if (backgroundWakeLock?.isHeld == true) {
+                backgroundWakeLock?.release()
+                app.auditLogger.logInfo("Lifecycle", "Released background PARTIAL_WAKE_LOCK")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to release background wake lock", e)
         }
     }
 
@@ -992,6 +1042,23 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             contentLayout.addView(btnAdd)
+            val btnPurge = MaterialButton(this, null, com.google.android.material.R.attr.borderlessButtonStyle).apply {
+                text = UiStrings.btnPurgeSession(lang)
+                textSize = 12f
+                setTextColor(Color.parseColor("#F87171"))
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    setMargins(0, 6, 0, 4)
+                }
+                setOnClickListener {
+                    promptPurgeProfileSession(activeProfile) {
+                        dialogRef?.dismiss()
+                    }
+                }
+            }
+            contentLayout.addView(btnPurge)
         }
 
         refreshList()
@@ -1082,6 +1149,40 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton(UiStrings.btnCancel(lang), null)
             .show()
+    }
+
+    private fun promptPurgeProfileSession(profile: AccountProfile, onPurged: () -> Unit) {
+        val lang = app.uiLanguageManager.language.value
+        MaterialAlertDialogBuilder(this)
+            .setTitle(UiStrings.confirmPurgeSessionTitle(lang))
+            .setMessage(UiStrings.confirmPurgeSessionMsg(lang, profile.displayName))
+            .setPositiveButton(UiStrings.btnDelete(lang)) { _, _ ->
+                purgeProfileSession(profile)
+                Toast.makeText(this, UiStrings.toastSessionPurged(lang), Toast.LENGTH_SHORT).show()
+                onPurged()
+            }
+            .setNegativeButton(UiStrings.btnCancel(lang), null)
+            .show()
+    }
+
+    private fun purgeProfileSession(profile: AccountProfile) {
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)) {
+                val profileStore = ProfileStore.getInstance()
+                val p = profileStore.getOrCreateProfile(profile.storageKey)
+                p.cookieManager.removeAllCookies(null)
+                p.webStorage.deleteAllData()
+            } else {
+                CookieManager.getInstance().removeAllCookies(null)
+                android.webkit.WebStorage.getInstance().deleteAllData()
+            }
+            webView?.clearCache(true)
+            webView?.loadUrl(CLAUDE_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
+            app.auditLogger.logInfo("Accounts", "Purged session and cache for profile: ${profile.displayName}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to purge profile session", e)
+            app.auditLogger.logWarning("Accounts", "Failed to purge session: ${e.message}")
+        }
     }
 
     private fun handleVpnStateChange(state: VpnTunnelState, proxyPort: Int) {
@@ -1674,6 +1775,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        releaseBackgroundWakeLock()
         bannerFlashJob?.cancel()
 
         fileChooserCallback?.onReceiveValue(null)

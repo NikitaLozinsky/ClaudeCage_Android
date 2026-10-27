@@ -87,6 +87,12 @@ class UiStringsAndLanguageTest {
             assertTrue(UiStrings.statusLeakRiskConcise(lang).isNotBlank())
             assertTrue(UiStrings.subStatusActive(lang, "tun0", 9050).isNotBlank())
             assertTrue(UiStrings.subStatusOffline(lang, 9050).isNotBlank())
+            assertTrue(UiStrings.btnReload(lang).isNotBlank())
+            assertTrue(UiStrings.toastReloading(lang).isNotBlank())
+            assertTrue(UiStrings.btnPurgeSession(lang).isNotBlank())
+            assertTrue(UiStrings.confirmPurgeSessionTitle(lang).isNotBlank())
+            assertTrue(UiStrings.confirmPurgeSessionMsg(lang, "Work").isNotBlank())
+            assertTrue(UiStrings.toastSessionPurged(lang).isNotBlank())
         }
     }
 

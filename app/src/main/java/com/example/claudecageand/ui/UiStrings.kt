@@ -363,4 +363,34 @@ object UiStrings {
         UiLanguage.RU -> "Kill-Switch активен • SOCKS5: 127.0.0.1:$port"
         UiLanguage.EN -> "Kill-Switch active • SOCKS5: 127.0.0.1:$port"
     }
+
+    fun btnReload(lang: UiLanguage): String = when (lang) {
+        UiLanguage.RU -> "🔄 Обновить"
+        UiLanguage.EN -> "🔄 Reload"
+    }
+
+    fun toastReloading(lang: UiLanguage): String = when (lang) {
+        UiLanguage.RU -> "Перезагрузка страницы..."
+        UiLanguage.EN -> "Reloading page..."
+    }
+
+    fun btnPurgeSession(lang: UiLanguage): String = when (lang) {
+        UiLanguage.RU -> "🧹 Очистить кэш и сессию"
+        UiLanguage.EN -> "🧹 Purge Cache & Session"
+    }
+
+    fun confirmPurgeSessionTitle(lang: UiLanguage): String = when (lang) {
+        UiLanguage.RU -> "Сброс кэша и куки"
+        UiLanguage.EN -> "Purge Cache & Cookies"
+    }
+
+    fun confirmPurgeSessionMsg(lang: UiLanguage, profileName: String): String = when (lang) {
+        UiLanguage.RU -> "Очистить куки, локальное хранилище и кэш для профиля «$profileName»? Это устранит любые залипания Cloudflare, но вам потребуется снова войти в аккаунт."
+        UiLanguage.EN -> "Clear cookies, local storage, and cache for profile \"$profileName\"? This clears any Cloudflare loops, but you will need to sign in again."
+    }
+
+    fun toastSessionPurged(lang: UiLanguage): String = when (lang) {
+        UiLanguage.RU -> "Кэш и сессия профиля очищены!"
+        UiLanguage.EN -> "Profile cache and session purged!"
+    }
 }

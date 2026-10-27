@@ -160,6 +160,7 @@ class ClaudeCageNotificationBridge(
                 }
 
                 auditLogger.logInfo("Notification", "Notification displayed: id=$notifId title='$cleanTitle' tag=$cleanTag")
+                (activity as? MainActivity)?.releaseBackgroundWakeLock()
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to display notification", e)
                 auditLogger.logWarning("Notification", "Failed to display notification $notifId: ${e.message}")
