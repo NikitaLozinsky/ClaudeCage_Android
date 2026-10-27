@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+
+    <!-- VPN Status Banner Colors -->
+    <color name="vpn_active_bg">#1B5E20</color>
+    <color name="vpn_active_text">#E8F5E9</color>
+    <color name="vpn_inactive_bg">#B71C1C</color>
+    <color name="vpn_inactive_text">#FFEBEE</color>
+    <color name="vpn_restored_bg">#2E7D32</color>
+    <color name="vpn_restored_text">#FFFFFF</color>
+
+    <!-- Overlay & Placeholder Colors -->
+    <color name="overlay_bg">#121212</color>
+    <color name="overlay_text_primary">#EEEEEE</color>
+    <color name="overlay_text_secondary">#9E9E9E</color>
+
+    <color name="error_bg">#2C0B0E</color>
+    <color name="error_text">#FFCDD2</color>
+
+    <color name="webview_placeholder_bg">#121212</color>
+    <color name="webview_placeholder_text">#757575</color>
+</resources>

@@ -1,0 +1,266 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/main"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@color/black"
+    tools:context=".MainActivity">
+
+    <!-- Top status bar for real-time VPN tunnel monitor & diagnostic actions (Collapsible) -->
+    <LinearLayout
+        android:id="@+id/vpnStatusBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:minHeight="42dp"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:paddingVertical="4dp"
+        android:paddingHorizontal="10dp"
+        android:background="#161B22">
+
+        <!-- Status chip / text container -->
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center_vertical"
+            android:paddingEnd="6dp">
+
+            <TextView
+                android:id="@+id/tvVpnStatus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textStyle="bold"
+                android:textSize="12sp"
+                android:textColor="#4ADE80"
+                android:text="@string/vpn_status_offline"
+                android:maxLines="1"
+                android:ellipsize="end" />
+
+            <TextView
+                android:id="@+id/tvVpnSubStatus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textSize="9sp"
+                android:textColor="#94A3B8"
+                android:text="SOCKS5: 127.0.0.1"
+                android:maxLines="1"
+                android:ellipsize="end" />
+        </LinearLayout>
+
+        <!-- Return to Claude.ai button (visible when on BrowserLeaks) -->
+        <TextView
+            android:id="@+id/btnReturnToClaude"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingHorizontal="8dp"
+            android:paddingVertical="4dp"
+            android:layout_marginEnd="4dp"
+            android:background="#33FFFFFF"
+            android:textColor="@color/white"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:text="@string/diag_return_to_claude"
+            android:visibility="gone" />
+
+        <!-- Account switcher button -->
+        <TextView
+            android:id="@+id/btnAccountSwitcher"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingHorizontal="8dp"
+            android:paddingVertical="4dp"
+            android:layout_marginEnd="4dp"
+            android:background="#1F2937"
+            android:textColor="#E2E8F0"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:maxWidth="110dp"
+            android:text="👤 Account" />
+
+        <!-- Language toggle button (RU / EN) -->
+        <TextView
+            android:id="@+id/btnLangToggle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingHorizontal="8dp"
+            android:paddingVertical="4dp"
+            android:layout_marginEnd="4dp"
+            android:background="#1F2937"
+            android:textColor="#E2E8F0"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:text="RU" />
+
+        <!-- Quick diagnostic button -->
+        <TextView
+            android:id="@+id/btnDiagnostics"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingHorizontal="8dp"
+            android:paddingVertical="4dp"
+            android:layout_marginEnd="4dp"
+            android:background="#1F2937"
+            android:textColor="#E2E8F0"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:text="@string/diag_button_label" />
+
+        <!-- Collapse top bar button -->
+        <TextView
+            android:id="@+id/btnCollapseBar"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingHorizontal="8dp"
+            android:paddingVertical="4dp"
+            android:background="#1F2937"
+            android:textColor="#94A3B8"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:text="▲" />
+    </LinearLayout>
+
+    <!-- Content area: WebView container, Floating Anchor, Waiting overlay, and Security error overlay -->
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <!-- Container into which WebView is dynamically attached ONLY after PROXY_OVERRIDE is active -->
+        <FrameLayout
+            android:id="@+id/webViewContainer"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@color/black" />
+
+        <!-- Sleek Floating Security Anchor / Status Pill -->
+        <LinearLayout
+            android:id="@+id/floatingSecurityAnchor"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|end"
+            android:layout_marginTop="8dp"
+            android:layout_marginEnd="12dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingVertical="5dp"
+            android:paddingHorizontal="10dp"
+            android:background="@drawable/bg_floating_security_pill"
+            android:elevation="6dp"
+            android:clickable="true"
+            android:focusable="true">
+
+            <!-- Security indicator dot -->
+            <View
+                android:id="@+id/viewAnchorDot"
+                android:layout_width="7dp"
+                android:layout_height="7dp"
+                android:layout_marginEnd="6dp"
+                android:background="@drawable/bg_status_dot_green" />
+
+            <TextView
+                android:id="@+id/tvFloatingAnchorStatus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="🛡️ Защищено"
+                android:textColor="#F1F5F9"
+                android:textSize="11sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tvFloatingAnchorAccount"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:paddingHorizontal="4dp"
+                android:paddingVertical="2dp"
+                android:clickable="true"
+                android:focusable="true"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:text="• 👤 Default ▾"
+                android:textColor="#94A3B8"
+                android:textSize="10sp"
+                android:maxLines="1"
+                android:ellipsize="end"
+                android:maxWidth="110dp" />
+        </LinearLayout>
+
+        <!-- Clean dark-mode waiting overlay when VPN is offline before first load -->
+        <LinearLayout
+            android:id="@+id/waitingOverlay"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:padding="32dp"
+            android:background="@color/overlay_bg"
+            android:visibility="gone">
+
+            <ProgressBar
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:indeterminateTint="@color/overlay_text_secondary"
+                android:layout_marginBottom="24dp" />
+
+            <TextView
+                android:id="@+id/tvWaitingTitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/waiting_for_vpn_title"
+                android:textColor="@color/overlay_text_primary"
+                android:textSize="18sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="8dp"
+                android:textAlignment="center" />
+
+            <TextView
+                android:id="@+id/tvWaitingDesc"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/waiting_for_vpn_desc"
+                android:textColor="@color/overlay_text_secondary"
+                android:textSize="14sp"
+                android:textAlignment="center" />
+        </LinearLayout>
+
+        <!-- Hard Security error overlay if PROXY_OVERRIDE is unsupported -->
+        <LinearLayout
+            android:id="@+id/securityErrorOverlay"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:padding="32dp"
+            android:background="@color/error_bg"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/tvSecurityErrorTitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/security_error_title"
+                android:textColor="@color/error_text"
+                android:textSize="18sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="12dp"
+                android:textAlignment="center" />
+
+            <TextView
+                android:id="@+id/tvSecurityErrorDesc"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/security_error_desc"
+                android:textColor="@color/error_text"
+                android:textSize="14sp"
+                android:textAlignment="center" />
+        </LinearLayout>
+
+    </FrameLayout>
+
+</LinearLayout>

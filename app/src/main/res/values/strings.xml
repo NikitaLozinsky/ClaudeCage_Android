@@ -1,0 +1,22 @@
+<resources>
+    <string name="app_name">ClaudeCage</string>
+    <string name="vpn_status_offline">NO VPN - NETWORK ISOLATED (OFFLINE)</string>
+    <string name="vpn_status_active_format">VPN ACTIVE: %1$s (%2$s) | SOCKS5: 127.0.0.1:%3$d</string>
+    <string name="vpn_status_offline_format">NO VPN - NETWORK ISOLATED (OFFLINE) | SOCKS5: 127.0.0.1:%1$d</string>
+    <string name="vpn_status_connection_lost">Connection lost (VPN disconnected) — network traffic blocked</string>
+    <string name="vpn_status_restored">VPN restored — traffic unblocked</string>
+    <string name="waiting_for_vpn_title">Waiting for VPN connection…</string>
+    <string name="waiting_for_vpn_desc">Network traffic is strictly isolated until Amnezia VPN tunnel is connected.</string>
+    <string name="security_error_title">Security Error: Proxy Override Unsupported</string>
+    <string name="security_error_desc">WebViewFeature.PROXY_OVERRIDE is not supported by the system WebView. WebView instantiation blocked to prevent network leaks.</string>
+    <string name="webview_placeholder">WebView loading…</string>
+
+    <!-- Diagnostics -->
+    <string name="diag_button_label">TEST</string>
+    <string name="diag_return_to_claude">← Claude</string>
+    <string name="diag_dialog_title">Security &amp; Network Diagnostics</string>
+    <string name="diag_dialog_open_browserleaks">Run BrowserLeaks Test</string>
+    <string name="diag_dialog_open_claude">Open Claude.ai</string>
+    <string name="diag_dialog_close">Close</string>
+    <string name="diag_dialog_message">Status Details:\n• SOCKS5 Proxy: 127.0.0.1:%1$d\n• Active Tunnel: %2$s\n• Target Locale: en-US\n• Timezone: Europe/Amsterdam (CET/CEST)\n• WebRTC Kill: ACTIVE (RTCPeerConnection blocked)\n• Outbound DNS: DNS-over-TCP via tun0</string>
+</resources>

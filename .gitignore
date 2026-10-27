@@ -1,0 +1,52 @@
+# ==========================================
+# ClaudeCage Android Project .gitignore
+# ==========================================
+
+# Built application packages & binaries
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Gradle build & cache directories
+.gradle/
+build/
+app/build/
+**/build/
+/captures
+
+# Local device / user configuration (contains SDK paths and local machine configs)
+local.properties
+.kotlin/
+
+# Android Studio / IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# System / OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
+*~
+
+# Logs & Telemetry (prevents leaking device serials and runtime logs)
+*.log
+logs.txt
+logs_from_app/*
+!logs_from_app/.gitkeep
+
+# Keystores & Signing Secrets
+*.jks
+*.keystore
+*.key
+*.p8
+*.p12
+*.pem
+
+# Native build cache
+.externalNativeBuild/
+.cxx/
