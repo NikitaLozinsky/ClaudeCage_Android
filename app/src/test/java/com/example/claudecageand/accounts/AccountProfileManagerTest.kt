@@ -200,34 +200,49 @@ class AccountProfileManagerTest {
     @Test
     fun fallbackCookieStorage_encryptsAndRestoresCookies() {
         val fallback = AccountCookieJarFallback(mockContext, fakePrefs)
-        val testCookies = "sessionKey=sk-ant-test12345; __cf_bm=randomcfbmvalue; other=val"
+        val testCookies = "sessionKey=tok-auth-test12345; __cf_bm=randomcfbmvalue; other=val"
 
         fallback.saveCookies("test-profile-1", testCookies)
         val restored = fallback.getCookies("test-profile-1")
         assertEquals(testCookies, restored)
 
         // Verify cookies for different profiles are isolated
-        fallback.saveCookies("test-profile-2", "sessionKey=sk-ant-different6789")
+        fallback.saveCookies("test-profile-2", "sessionKey=tok-auth-different6789")
         assertEquals(testCookies, fallback.getCookies("test-profile-1"))
-        assertEquals("sessionKey=sk-ant-different6789", fallback.getCookies("test-profile-2"))
+        assertEquals("sessionKey=tok-auth-different6789", fallback.getCookies("test-profile-2"))
 
         // Delete cookies
         fallback.deleteCookies("test-profile-1")
         assertEquals(null, fallback.getCookies("test-profile-1"))
-        assertEquals("sessionKey=sk-ant-different6789", fallback.getCookies("test-profile-2"))
+        assertEquals("sessionKey=tok-auth-different6789", fallback.getCookies("test-profile-2"))
+    }
+
+    @Test
+    fun fallbackCookieStorage_aadPreventsCrossProfileDecryption() {
+        val fallback = AccountCookieJarFallback(mockContext, fakePrefs)
+        val encrypted = fallback.encrypt("profile-A", "secret-session-cookie")
+
+        // Decrypting with correct profile succeeds
+        val decryptedSuccess = fallback.decrypt("profile-A", encrypted)
+        assertEquals("secret-session-cookie", decryptedSuccess)
+
+        // Decrypting with wrong profile fails due to GCM AAD authentication tag mismatch
+        val decryptedFail = fallback.decrypt("profile-B", encrypted)
+        assertEquals(null, decryptedFail)
     }
 
     @Test
     fun jsonCodec_handlesSpecialCharactersAndCyrillic() {
         val profiles = listOf(
             AccountProfile("id1", "Рабочий аккаунт (Claude)", 1000L),
-            AccountProfile("id2", "Quotes \"and\" \\slashes\\, plus commas", 2000L)
+            AccountProfile("id2", "Quotes \"and\" \\slashes\\, plus commas", 2000L),
+            AccountProfile("id3", "Nested {Braces} and [Brackets] {dev}", 3000L)
         )
 
         val json = AccountProfileJsonCodec.toJson(profiles)
         val restored = AccountProfileJsonCodec.fromJson(json)
 
-        assertEquals(2, restored.size)
+        assertEquals(3, restored.size)
         assertEquals("id1", restored[0].id)
         assertEquals("Рабочий аккаунт (Claude)", restored[0].displayName)
         assertEquals(1000L, restored[0].createdAt)
@@ -235,6 +250,10 @@ class AccountProfileManagerTest {
         assertEquals("id2", restored[1].id)
         assertEquals("Quotes \"and\" \\slashes\\, plus commas", restored[1].displayName)
         assertEquals(2000L, restored[1].createdAt)
+
+        assertEquals("id3", restored[2].id)
+        assertEquals("Nested {Braces} and [Brackets] {dev}", restored[2].displayName)
+        assertEquals(3000L, restored[2].createdAt)
     }
 }
 

@@ -172,11 +172,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private class SafeDownloadBridge(
+        private val getActiveUrl: () -> String?,
         private val onDownloaded: (ByteArray, String, String) -> Unit,
         private val onFailed: (String) -> Unit
     ) {
         @JavascriptInterface
         fun onBlobDownloaded(base64Data: String, suggestedFilename: String, mimeType: String) {
+            val url = getActiveUrl() ?: ""
+            if (!url.startsWith("https://claude.ai/") && url != "https://claude.ai") {
+                onFailed("Download forbidden: unauthorized origin ($url)")
+                return
+            }
             val bytes = try {
                 Base64.decode(base64Data, Base64.DEFAULT)
             } catch (e: Exception) {
@@ -502,9 +508,11 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // Lock WebView traffic strictly to our loopback SOCKS5 proxy without any direct fallback
+        // Lock WebView traffic strictly to our loopback SOCKS5 proxy without any direct fallback.
+        // Explicitly remove implicit bypass rules so loopback destinations cannot be accessed directly.
         val proxyConfig = ProxyConfig.Builder()
             .addProxyRule("socks5://127.0.0.1:$proxyPort")
+            .removeImplicitRules()
             .build()
 
         ProxyController.getInstance().setProxyOverride(
@@ -564,6 +572,11 @@ class MainActivity : AppCompatActivity() {
         settings.allowFileAccess = false
         settings.allowContentAccess = false
 
+        // Disable Safe Browsing out-of-band requests that could bypass our local SOCKS5 proxy
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.SAFE_BROWSING_ENABLE)) {
+            androidx.webkit.WebSettingsCompat.setSafeBrowsingEnabled(settings, false)
+        }
+
         // Sanitize User-Agent to strip Android WebView markers
         val originalUa = settings.userAgentString
         val sanitizedUa = originalUa
@@ -597,6 +610,18 @@ class MainActivity : AppCompatActivity() {
                     return true
                 }
                 return false
+            }
+
+            override fun onRenderProcessGone(view: WebView?, detail: android.webkit.RenderProcessGoneDetail?): Boolean {
+                val didCrash = detail?.didCrash() ?: false
+                Log.w(TAG, "WebView render process gone! didCrash=$didCrash")
+                app.auditLogger.logCritical("WebView", "Render process gone (didCrash=$didCrash), rebuilding WebView")
+                (view?.parent as? ViewGroup)?.removeView(view)
+                view?.destroy()
+                webView = null
+                hasLoadedInitialUrl = false
+                initWebView()
+                return true
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
@@ -639,9 +664,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Wire SafeDownloadBridge and setDownloadListener (Stage 9)
+        // Wire SafeDownloadBridge with origin verification
         wv.addJavascriptInterface(
             SafeDownloadBridge(
+                getActiveUrl = { wv.url },
                 onDownloaded = { bytes, filename, _ ->
                     runOnUiThread {
                         pendingDownloadBytes = bytes
@@ -869,7 +895,6 @@ class MainActivity : AppCompatActivity() {
                         confirmDeleteProfile(profile) { wasActive ->
                             if (wasActive) {
                                 dialogRef?.dismiss()
-                                switchAccountProfile(app.accountProfileManager.activeProfile.value)
                             } else {
                                 refreshList()
                             }
@@ -973,6 +998,12 @@ class MainActivity : AppCompatActivity() {
             .setMessage(UiStrings.dialogDeleteConfirmMessage(lang, profile.displayName))
             .setPositiveButton(UiStrings.btnDelete(lang)) { _, _ ->
                 val wasActive = (profile.id == app.accountProfileManager.activeProfile.value.id)
+                if (wasActive) {
+                    val fallbackTarget = app.accountProfileManager.profiles.value.firstOrNull { it.id != profile.id }
+                    if (fallbackTarget != null) {
+                        switchAccountProfile(fallbackTarget)
+                    }
+                }
                 val success = app.accountProfileManager.deleteProfile(profile.id)
                 if (success) {
                     Toast.makeText(this, UiStrings.toastProfileDeleted(lang, profile.displayName), Toast.LENGTH_SHORT).show()

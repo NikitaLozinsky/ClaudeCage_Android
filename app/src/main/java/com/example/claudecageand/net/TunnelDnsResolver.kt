@@ -16,14 +16,20 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.SecureRandom
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlin.random.Random
 
 /**
  * Result of parsing or querying DNS response.
@@ -54,13 +60,26 @@ class TunnelDnsResolver(
 
     private data class CacheEntry(
         val address: Inet4Address,
+        val freshUntilMillis: Long,
+        val staleUntilMillis: Long
+    )
+
+    private data class StaleFallbackEntry(
+        val address: Inet4Address,
         val expiresAtMillis: Long
     )
 
     private val cache = ConcurrentHashMap<String, CacheEntry>()
     private val negativeCache = ConcurrentHashMap<String, Long>()
-    private val staleCache = ConcurrentHashMap<String, Inet4Address>()
-    private val domainLocks = ConcurrentHashMap<String, Mutex>()
+    private val staleCache = ConcurrentHashMap<String, StaleFallbackEntry>()
+    private val inFlightQueries = ConcurrentHashMap<String, Deferred<Inet4Address?>>()
+
+    private val dnsScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val secureRandom = SecureRandom()
+
+    private val watchdogExecutor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "DnsWatchdog").apply { isDaemon = true }
+    }
 
     val cacheSize: Int
         get() = cache.size
@@ -75,8 +94,8 @@ class TunnelDnsResolver(
      * Test helper to populate staleCache for verifying Stale-While-Revalidate fallback.
      */
     fun putStaleEntryForTesting(domain: String, address: Inet4Address) {
-        val cleanDomain = domain.trim().trimEnd('.').lowercase()
-        staleCache[cleanDomain] = address
+        val cleanDomain = domain.trim().trimEnd('.').lowercase(Locale.ROOT)
+        staleCache[cleanDomain] = StaleFallbackEntry(address, System.currentTimeMillis() + MAX_STALE_TTL_MILLIS)
     }
 
     /**
@@ -98,7 +117,7 @@ class TunnelDnsResolver(
         socketRegistrar: ((Socket) -> VpnTunnelState.Connected)? = null,
         onSocketClosed: ((Socket) -> Unit)? = null
     ): Inet4Address? {
-        val cleanDomain = domain.trim().trimEnd('.').lowercase()
+        val cleanDomain = domain.trim().trimEnd('.').lowercase(Locale.ROOT)
 
         // Fast-path 1: check if domain is already an IPv4 literal
         parseIpv4Literal(cleanDomain)?.let { return it }
@@ -117,168 +136,197 @@ class TunnelDnsResolver(
             }
         }
 
-        // Fast-path 3: Check in-memory positive cache before acquiring mutex
+        // Fast-path 3: Check in-memory positive cache (Fresh or Stale hit)
         val cached = cache[cleanDomain]
-        if (cached != null && cached.expiresAtMillis > now) {
-            auditLogger?.dnsCacheHits?.incrementAndGet()
-            return cached.address
+        if (cached != null) {
+            if (now <= cached.freshUntilMillis) {
+                auditLogger?.dnsCacheHits?.incrementAndGet()
+                return cached.address
+            } else if (now <= cached.staleUntilMillis) {
+                // True Stale-While-Revalidate: return stale immediately, revalidate in background
+                auditLogger?.dnsCacheHits?.incrementAndGet()
+                auditLogger?.log(
+                    LogCategory.DNS,
+                    LogLevel.INFO,
+                    "SWR hit for '$cleanDomain': serving stale IP while revalidating in background"
+                )
+                dnsScope.launch {
+                    runCatching {
+                        executeNetworkResolve(cleanDomain, tunIpv4, network, socketRegistrar, onSocketClosed)
+                    }
+                }
+                return cached.address
+            } else {
+                cache.remove(cleanDomain)
+            }
         }
 
-        // Deduplicate concurrent requests for the same domain via per-domain mutex
-        val lock = domainLocks.computeIfAbsent(cleanDomain) { Mutex() }
-        return lock.withLock {
-            val nowInLock = System.currentTimeMillis()
+        // Single-flight deduplication for network queries
+        return executeNetworkResolve(cleanDomain, tunIpv4, network, socketRegistrar, onSocketClosed)
+    }
 
-            // Check negative cache inside lock
-            val negInLock = negativeCache[cleanDomain]
-            if (negInLock != null) {
-                if (negInLock > nowInLock) {
-                    auditLogger?.dnsCacheHits?.incrementAndGet()
-                    return@withLock null
-                } else {
-                    negativeCache.remove(cleanDomain)
-                }
+    private suspend fun executeNetworkResolve(
+        cleanDomain: String,
+        tunIpv4: Inet4Address,
+        network: Network?,
+        socketRegistrar: ((Socket) -> VpnTunnelState.Connected)?,
+        onSocketClosed: ((Socket) -> Unit)?
+    ): Inet4Address? {
+        val deferred = inFlightQueries.compute(cleanDomain) { _, existing ->
+            existing ?: dnsScope.async(Dispatchers.IO) {
+                performNetworkResolve(cleanDomain, tunIpv4, network, socketRegistrar, onSocketClosed)
             }
+        }!!
 
-            // Check positive cache inside lock
-            val cachedInLock = cache[cleanDomain]
-            if (cachedInLock != null && cachedInLock.expiresAtMillis > nowInLock) {
-                auditLogger?.dnsCacheHits?.incrementAndGet()
-                return@withLock cachedInLock.address
-            }
+        return try {
+            deferred.await()
+        } finally {
+            inFlightQueries.remove(cleanDomain, deferred)
+        }
+    }
 
-            auditLogger?.dnsNetworkLookups?.incrementAndGet()
-            val startTime = System.currentTimeMillis()
+    private suspend fun performNetworkResolve(
+        cleanDomain: String,
+        tunIpv4: Inet4Address,
+        network: Network?,
+        socketRegistrar: ((Socket) -> VpnTunnelState.Connected)?,
+        onSocketClosed: ((Socket) -> Unit)?
+    ): Inet4Address? {
+        val now = System.currentTimeMillis()
+        auditLogger?.dnsNetworkLookups?.incrementAndGet()
+        val startTime = System.currentTimeMillis()
 
-            // 1. Query Primary DNS (1.1.1.1:53) over TCP
-            var response = tryQueryDnsServer(
-                serverIp = PRIMARY_DNS_IP,
+        // 1. Primary DNS (1.1.1.1:53) over TCP
+        var response = tryQueryDnsServer(
+            serverIp = PRIMARY_DNS_IP,
+            domain = cleanDomain,
+            tunIpv4 = tunIpv4,
+            network = network,
+            socketRegistrar = socketRegistrar,
+            onSocketClosed = onSocketClosed
+        )
+        var usedServer = PRIMARY_DNS_STR
+
+        // 2. Fallback to 8.8.8.8:53 over TCP
+        if (response.address == null && !response.isNoData && response.rcode != 3) {
+            Log.w(TAG, "Primary DNS ($PRIMARY_DNS_STR) query failed for $cleanDomain; trying fallback ($FALLBACK_DNS_STR)")
+            auditLogger?.log(
+                LogCategory.DNS,
+                LogLevel.WARN,
+                "Primary DNS failed for '$cleanDomain', attempting fallback $FALLBACK_DNS_STR"
+            )
+
+            response = tryQueryDnsServer(
+                serverIp = FALLBACK_DNS_IP,
                 domain = cleanDomain,
                 tunIpv4 = tunIpv4,
                 network = network,
                 socketRegistrar = socketRegistrar,
                 onSocketClosed = onSocketClosed
             )
+            usedServer = FALLBACK_DNS_STR
 
-            var usedServer = PRIMARY_DNS_STR
-
-            // If primary query failed (and is not an authoritative NODATA/NXDOMAIN), try fallback
+            // 3. Radio / Tunnel wake-up retry: if both failed right after waking from idle sleep,
+            // do a quick retry on primary DNS after a 150ms backoff
             if (response.address == null && !response.isNoData && response.rcode != 3) {
-                Log.w(TAG, "Primary DNS ($PRIMARY_DNS_STR) query failed for $cleanDomain; trying fallback ($FALLBACK_DNS_STR)")
-                auditLogger?.log(
-                    LogCategory.DNS,
-                    LogLevel.WARN,
-                    "Primary DNS failed for '$cleanDomain', attempting fallback $FALLBACK_DNS_STR"
-                )
-
-                // 2. Fallback to 8.8.8.8:53 over TCP
+                delay(150)
+                Log.w(TAG, "Both DNS servers failed for $cleanDomain; performing wake-up retry on $PRIMARY_DNS_STR")
                 response = tryQueryDnsServer(
-                    serverIp = FALLBACK_DNS_IP,
+                    serverIp = PRIMARY_DNS_IP,
                     domain = cleanDomain,
                     tunIpv4 = tunIpv4,
                     network = network,
                     socketRegistrar = socketRegistrar,
                     onSocketClosed = onSocketClosed
                 )
-                usedServer = FALLBACK_DNS_STR
-
-                // 3. Radio / Tunnel wake-up retry: if both failed right after waking from idle sleep,
-                // do a quick retry on primary DNS after a 150ms backoff
-                if (response.address == null && !response.isNoData && response.rcode != 3) {
-                    delay(150)
-                    Log.w(TAG, "Both DNS servers failed for $cleanDomain; performing wake-up retry on $PRIMARY_DNS_STR")
-                    response = tryQueryDnsServer(
-                        serverIp = PRIMARY_DNS_IP,
-                        domain = cleanDomain,
-                        tunIpv4 = tunIpv4,
-                        network = network,
-                        socketRegistrar = socketRegistrar,
-                        onSocketClosed = onSocketClosed
-                    )
-                    usedServer = "$PRIMARY_DNS_STR (retry)"
-                }
+                usedServer = "$PRIMARY_DNS_STR (retry)"
             }
+        }
 
-            if (response.isNoData) {
-                // Legitimate RFC 2308 NODATA (e.g. brunhild.challenges.cloudflare.com)
-                // Cache negatively without incrementing dnsFailures
-                negativeCache[cleanDomain] = System.currentTimeMillis() + NEGATIVE_CACHE_TTL_MILLIS
-                auditLogger?.log(
-                    LogCategory.DNS,
-                    LogLevel.INFO,
-                    "DNS NODATA (IPv6 canary) for '$cleanDomain'; cached negatively for 60s"
-                )
-                return@withLock null
-            }
+        if (response.isNoData) {
+            negativeCache[cleanDomain] = System.currentTimeMillis() + NEGATIVE_CACHE_TTL_MILLIS
+            auditLogger?.log(
+                LogCategory.DNS,
+                LogLevel.INFO,
+                "DNS NODATA (IPv6 canary) for '$cleanDomain'; cached negatively for 60s"
+            )
+            return null
+        }
 
-            if (response.rcode == 3) {
-                // NXDOMAIN: domain does not exist
-                negativeCache[cleanDomain] = System.currentTimeMillis() + NEGATIVE_CACHE_TTL_MILLIS
+        if (response.rcode == 3) {
+            negativeCache[cleanDomain] = System.currentTimeMillis() + NEGATIVE_CACHE_TTL_MILLIS
+            auditLogger?.log(
+                LogCategory.DNS,
+                LogLevel.WARN,
+                "DNS NXDOMAIN for '$cleanDomain'; cached negatively for 60s"
+            )
+            return null
+        }
+
+        val resolved = if (response.address != null) {
+            val latency = System.currentTimeMillis() - startTime
+            auditLogger?.recordDnsLatency(latency)
+            auditLogger?.log(
+                LogCategory.DNS,
+                LogLevel.INFO,
+                "DNS resolved '$cleanDomain' via $usedServer in ${latency}ms"
+            )
+            val addr = response.address
+            staleCache[cleanDomain] = StaleFallbackEntry(addr, System.currentTimeMillis() + MAX_STALE_TTL_MILLIS)
+            addr
+        } else {
+            val stale = staleCache[cleanDomain]
+            if (stale != null && stale.expiresAtMillis > System.currentTimeMillis()) {
                 auditLogger?.log(
                     LogCategory.DNS,
                     LogLevel.WARN,
-                    "DNS NXDOMAIN for '$cleanDomain'; cached negatively for 60s"
+                    "Wake-up fallback: serving last-known IP for '$cleanDomain'"
                 )
-                return@withLock null
-            }
-
-            val resolved = if (response.address != null) {
-                val latency = System.currentTimeMillis() - startTime
-                auditLogger?.recordDnsLatency(latency)
+                Log.w(TAG, "Wake-up fallback: serving last-known IP for '$cleanDomain'")
+                stale.address
+            } else {
+                auditLogger?.dnsFailures?.incrementAndGet()
                 auditLogger?.log(
                     LogCategory.DNS,
-                    LogLevel.INFO,
-                    "DNS resolved '$cleanDomain' via $usedServer in ${latency}ms"
+                    LogLevel.ERROR,
+                    "DNS resolution failed for '$cleanDomain' on all servers"
                 )
-                val addr = response.address
-                staleCache[cleanDomain] = addr
-                addr
-            } else {
-                val stale = staleCache[cleanDomain]
-                if (stale != null) {
-                    auditLogger?.log(
-                        LogCategory.DNS,
-                        LogLevel.WARN,
-                        "Wake-up fallback: serving last-known IP for '$cleanDomain'"
-                    )
-                    Log.w(TAG, "Wake-up fallback: serving last-known IP for '$cleanDomain'")
-                    stale
-                } else {
-                    auditLogger?.dnsFailures?.incrementAndGet()
-                    auditLogger?.log(
-                        LogCategory.DNS,
-                        LogLevel.ERROR,
-                        "DNS resolution failed for '$cleanDomain' on all servers"
-                    )
-                    throw IOException("DNS resolution failed for '$cleanDomain' on both primary and fallback DNS servers")
-                }
+                throw IOException("DNS resolution failed for '$cleanDomain' on both primary and fallback DNS servers")
             }
-
-            // Store in cache for 5 minutes and update telemetry cache counter
-            cache[cleanDomain] = CacheEntry(
-                address = resolved,
-                expiresAtMillis = System.currentTimeMillis() + CACHE_TTL_MILLIS
-            )
-            auditLogger?.dnsCacheEntries?.set(cache.size.toLong())
-
-            resolved
         }
+
+        // Store in cache with fresh and stale TTLs
+        cache[cleanDomain] = CacheEntry(
+            address = resolved,
+            freshUntilMillis = System.currentTimeMillis() + FRESH_TTL_MILLIS,
+            staleUntilMillis = System.currentTimeMillis() + MAX_STALE_TTL_MILLIS
+        )
+        auditLogger?.dnsCacheEntries?.set(cache.size.toLong())
+
+        return resolved
     }
 
     /**
-     * Clears all cached DNS records (positive, negative, and stale). Called immediately upon VPN disconnect.
+     * Clears all cached DNS records. Called upon VPN disconnect.
+     * When [clearStale] is false, keeps stale records to allow instant Doze wake-up fallback.
      */
-    fun clearCache() {
-        val size = cache.size + negativeCache.size + staleCache.size
+    fun clearCache(clearStale: Boolean = true) {
+        val size = cache.size + negativeCache.size + (if (clearStale) staleCache.size else 0)
         cache.clear()
         negativeCache.clear()
-        staleCache.clear()
-        domainLocks.clear()
+        if (clearStale) {
+            staleCache.clear()
+        }
+        inFlightQueries.clear()
         auditLogger?.dnsCacheEntries?.set(0)
         if (size > 0) {
-            auditLogger?.log(LogCategory.DNS, LogLevel.INFO, "Cleared $size cached DNS entries on VPN drop")
+            auditLogger?.log(
+                LogCategory.DNS,
+                LogLevel.INFO,
+                "Cleared $size cached DNS entries (clearStale=$clearStale)"
+            )
         }
-        Log.d(TAG, "DNS cache cleared")
+        Log.d(TAG, "DNS cache cleared (clearStale=$clearStale)")
     }
 
     private suspend fun tryQueryDnsServer(
@@ -290,10 +338,10 @@ class TunnelDnsResolver(
         onSocketClosed: ((Socket) -> Unit)?
     ): DnsResponse = withContext(Dispatchers.IO) {
         val socket = Socket()
-        val watchdog = launch {
-            delay(DNS_TIMEOUT_MS.toLong())
+        val watchdogFuture = watchdogExecutor.schedule({
             runCatching { socket.close() }
-        }
+        }, DNS_TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)
+
         return@withContext try {
             val verifiedTunnel = socketRegistrar?.invoke(socket)
             val boundIp = verifiedTunnel?.tunIpv4 ?: tunIpv4
@@ -308,7 +356,7 @@ class TunnelDnsResolver(
             socket.bind(InetSocketAddress(boundIp, 0))
             socket.connect(InetSocketAddress(serverIp, DNS_PORT), DNS_TIMEOUT_MS)
 
-            val queryId = Random.nextInt(1, 0xFFFF)
+            val queryId = secureRandom.nextInt(0xFFFF - 1) + 1
             val queryPacket = buildTcpDnsQuery(domain, queryId)
 
             val dos = DataOutputStream(socket.getOutputStream())
@@ -321,13 +369,13 @@ class TunnelDnsResolver(
             dis.readFully(responseBytes)
 
             auditLogger?.consecutiveNetworkTimeouts?.set(0)
-            parseTcpDnsResponse(responseBytes, queryId)
+            parseTcpDnsResponse(responseBytes, queryId, domain)
         } catch (e: Exception) {
             auditLogger?.consecutiveNetworkTimeouts?.incrementAndGet()
             Log.w(TAG, "DNS query exception/timeout for $domain on $serverIp: ${e.message}")
             DnsResponse(isError = true)
         } finally {
-            watchdog.cancel()
+            watchdogFuture.cancel(false)
             runCatching { socket.close() }
             onSocketClosed?.invoke(socket)
         }
@@ -337,8 +385,10 @@ class TunnelDnsResolver(
         private const val TAG = "TunnelDnsResolver"
         private const val DNS_PORT = 53
         private const val DNS_TIMEOUT_MS = 2500
-        const val CACHE_TTL_MILLIS = 300_000L
-        const val NEGATIVE_CACHE_TTL_MILLIS = 60_000L
+        const val FRESH_TTL_MILLIS = 300_000L // 5 minutes
+        const val CACHE_TTL_MILLIS = FRESH_TTL_MILLIS
+        const val MAX_STALE_TTL_MILLIS = 86_400_000L // 24 hours
+        const val NEGATIVE_CACHE_TTL_MILLIS = 60_000L // 1 minute
 
         private const val PRIMARY_DNS_STR = "1.1.1.1"
         private const val FALLBACK_DNS_STR = "8.8.8.8"
@@ -408,10 +458,14 @@ class TunnelDnsResolver(
 
         /**
          * Parses an RFC 1035 DNS response payload (excluding the 2-byte TCP prefix).
-         * Extracts the first A record (IPv4) from the answer section.
+         * Extracts A records (IPv4) from the answer section and selects one.
          * Identifies RFC 2308 NODATA (RCODE 0 with 0 answers) for IPv6 canary domains.
          */
-        fun parseTcpDnsResponse(responseBytes: ByteArray, expectedQueryId: Int): DnsResponse {
+        fun parseTcpDnsResponse(
+            responseBytes: ByteArray,
+            expectedQueryId: Int,
+            expectedDomain: String? = null
+        ): DnsResponse {
             if (responseBytes.size < 12) return DnsResponse(isError = true)
             val buffer = ByteBuffer.wrap(responseBytes).order(ByteOrder.BIG_ENDIAN)
 
@@ -446,6 +500,7 @@ class TunnelDnsResolver(
                 buffer.short // QCLASS
             }
 
+            val aRecords = mutableListOf<Inet4Address>()
             // Parse answers
             for (i in 0 until anCount) {
                 skipDnsName(buffer)
@@ -463,15 +518,21 @@ class TunnelDnsResolver(
                     val ip = runCatching {
                         InetAddress.getByAddress(ipBytes) as? Inet4Address
                     }.getOrNull()
-                    return DnsResponse(address = ip, isNoData = (ip == null), rcode = 0)
+                    if (ip != null) {
+                        aRecords.add(ip)
+                    }
                 } else {
                     // Skip CNAME or other records
                     buffer.position(buffer.position() + rdLength)
                 }
             }
 
-            // No A record found in answers
-            return DnsResponse(address = null, isNoData = true, rcode = 0)
+            return if (aRecords.isNotEmpty()) {
+                val chosen = if (aRecords.size == 1) aRecords[0] else aRecords.random()
+                DnsResponse(address = chosen, isNoData = false, rcode = 0)
+            } else {
+                DnsResponse(address = null, isNoData = true, rcode = 0)
+            }
         }
 
         private fun skipDnsName(buffer: ByteBuffer) {

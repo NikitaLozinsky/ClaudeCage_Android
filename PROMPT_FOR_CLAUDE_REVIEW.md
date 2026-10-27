@@ -78,69 +78,82 @@ Be thoroughly critical, rigorous, and technical in your analysis.
 
 ---
 
-## Вариант 2: На русском языке
+## Вариант 3: Промпт повторной проверки (Stage 10 Verification / Follow-up Review)
+
+> **Назначение:** Используйте этот промпт для повторной отправки в Claude Sonnet / Claude Code вместе с обновлённым файлом [`ENTERPRISE_PORTAL_AUDIT_PACKAGE.md`](ENTERPRISE_PORTAL_AUDIT_PACKAGE.md) после внедрения исправлений по замечаниям предыдущего ревью.
+
+### English version (Recommended):
 
 ```markdown
-# РОЛЬ И ЗАДАЧА
-Ты — ведущий архитектор информационной безопасности Android, системный инженер сетевого стека Linux и специалист по Zero-Trust инфраструктуре.
+# ASSIGNMENT: STAGE 10 ZERO-TRUST VERIFICATION & POST-REMEDIATION AUDIT
 
-Наша команда кибербезопасности и сетевого инжиниринга разработала корпоративный мобильный контейнер изоляции веб-приложений **`EnclaveShield`** (`com.corp.enclaveshield`) для Android 13+ (API 33–37, протестирован на флагманских устройствах, включая Samsung Galaxy S25 Ultra).
+You previously conducted an architectural code review of our **`EnclaveShield`** enterprise container (`com.corp.enclaveshield`) and identified critical P0 vulnerabilities: open proxy on loopback, `Dispatchers.IO` pool starvation, state conflation in kill-switch during handover, AndroidKeyStore caller-provided IV crash, unvalidated JS download bridge origin, and canvas destruction.
 
-К запросу прикреплён полный технический пакет документации и исходного кода (`ENTERPRISE_PORTAL_AUDIT_PACKAGE.md`).
-
----
-
-### КОНТЕКСТ И КОРПОРАТИВНЫЕ ТРЕБОВАНИЯ БЕЗОПАСНОСТИ
-В нашей организации действуют строгие корпоративные стандарты Zero-Trust и предотвращения утечек данных (DLP). Удалённые сотрудники, внешние подрядчики и инженеры безопасности работают с конфиденциальным внутренним интранет-порталом и кластером приватного ИИ (`https://portal.internal-enterprise.net`) с мобильных устройств.
-
-Использование стандартных браузеров (Chrome, Edge) строго запрещено из-за риска утечки системной телеметрии, аппаратного фингерпринтинга и скрытых утечек DNS. Приложение `EnclaveShield` спроектировано как **изолированный защитный анклав (Enterprise Browser Isolation)** со следующими незыблемыми инвариантами:
-
-1. **Принцип Strict Fail-Closed Zero-Leak:**
-   - Доступ к порталу разрешён строго через внутренний VPN-туннель (WireGuard/Amnezia, интерфейсы `tun0`/`tun1`).
-   - Весь трафик Chromium WebView принудительно направляется на локальный шлюз-привратник SOCKS5 (`127.0.0.1:<порт>`) через `ProxyController.setProxyOverride`. Прямой выход в сеть (`direct://`) аппаратным образом исключён.
-   - Каждый исходящий TCP-сокет на уровне ядра привязывается к NetID VPN (`network.bindSocket`) и локальному IP туннеля (`socket.bind(tunIpv4)`).
-   - **Аппаратный Kill-Switch:** При малейшем сбое VPN все активные дескрипторы сокетов немедленно закрываются. Ни один байт не может уйти через обычный Wi-Fi или сотовую связь.
-
-2. **Fail-Closed TCP DNS (RFC 1035) со сторожевым таймером (Watchdog):**
-   - Системный DNS Android и DNS мобильного провайдера полностью игнорируются для исключения DNS-leaks.
-   - Запросы резолвятся строго внутри зашифрованного туннеля через TCP (`1.1.1.1:53` -> `8.8.8.8:53`).
-   - **Защита от Doze Mode:** Для устранения 54-секундного зависания Linux ядра (`tcp_syn_retries`) при выходе из сна реализован неблокирующий сторожевой таймер корутины (2500 мс), принудительно закрывающий дескриптор сокета, с резервным Stale-While-Revalidate DNS-кэшем.
-
-3. **Региональный фильтр безопасности (Regional Geofencing Guard):**
-   - На уровне SOCKS5 отсекаются не доверенные региональные TLD (`.ru`, `.su`, `.by`, `.рф`) с возвратом `0x05 (Connection Refused)`, а запросы IPv6 отклоняются (`0x08`).
-
-4. **Маскировка фингерпринта и нейтрализация телеметрии:**
-   - Ампутация WebRTC до запуска скриптов страницы для исключения утечек локальных/публичных IP.
-   - Детерминированный шум Canvas для всех профилей (`getImageData`, `toDataURL`, `toBlob`).
-   - Блокировка детекции системных русских голосовых пакетов (`speechSynthesis.getVoices = () => []`).
-   - Фиксация локали `Intl.*` и таймзоны на корпоративный стандарт EMEA (`en-US`, `Europe/Amsterdam`).
-
-5. **Многопрофильная контейнеризация ролей:**
-   - Изоляция сессий сотрудников и подрядчиков через AndroidX `ProfileStore` (или резервный CookieJar с шифрованием AES-256-GCM в аппаратном `AndroidKeyStore`).
+We have executed a comprehensive **Stage 10 Zero-Trust Remediation** across the entire codebase. The complete, updated source package is attached in `ENTERPRISE_PORTAL_AUDIT_PACKAGE.md`.
 
 ---
 
-### ЦЕЛЬ АУДИТА (ЧТО ТРЕБУЕТСЯ ОТ ТЕБЯ)
-Проведи глубокий, бескомпромиссный архитектурный аудит и код-ревью прикреплённого пакета. Подробно проанализируй:
+### REMEDIATION SUMMARY
 
-1. **Сетевые инварианты и привязка сокетов в ядре:**
-   - Есть ли race conditions в `VpnGatekeeperProxy` и `VpnStateMonitor` в момент переключения сетей, при которых сокет мог бы уйти мимо туннеля?
-   - Насколько корректна последовательность `network.bindSocket(socket)` до `socket.bind(tunIpv4)` для современных версий Android (14–17)?
+1. **Zero-Trust Allowlist & Private Subnet Blacklist (`VpnGatekeeperProxy.kt`):**
+   - Implemented strict destination allowlist (`ALLOWED_DOMAIN_SUFFIXES`): only whitelisted corporate and infrastructure domains are permitted. All other domains return `0x05 (Connection Refused)`.
+   - Domain normalization: `.trim().trimEnd('.').lowercase(Locale.ROOT)`.
+   - Implemented `isForbiddenIp`: blocks loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), RFC 1918 private subnets (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), and tun IP.
+   - SOCKS5 loopback is no longer an open proxy for other apps.
 
-2. **Сторожевой таймер DNS и работа под высокой нагрузкой:**
-   - Оцени механизм `launch { delay(2500); socket.close() }` в `TunnelDnsResolver.kt`. Нет ли риска утечки файловых дескрипторов или исчерпания пула корутин при 30–50 параллельных запросах ресурсов?
-   - Оцени стратегию Stale-While-Revalidate DNS-кэша.
+2. **Dedicated Relay Thread Pool (`VpnGatekeeperProxy.kt`):**
+   - Replaced `Dispatchers.IO` with dedicated cached thread pool `relayExecutor = Executors.newCachedThreadPool { Thread(it, "Relay").apply { isDaemon = true } }.asCoroutineDispatcher()`.
+   - `Dispatchers.IO` (64 threads) is completely decoupled from long-lived socket `read()` pipes.
+   - Added symmetrical half-duplex socket shutdown (`shutdownOutput()` / `shutdownInput()`).
 
-3. **Песочница Document-Start JS и обход маскировки:**
-   - Проанализируй `AntiFingerprintHardener.kt`. Существуют ли векторы обхода через Web Workers, Service Workers, iframes или prototype pollution?
-   - Как улучшить математический алгоритм шума Canvas, чтобы он гарантировал отсутствие корреляции сессий, но не выглядел аномальным для анализаторов энтропии?
+3. **Generational Socket Tracking & Synchronous Kill-Switch (`VpnStateMonitor.kt`, `VpnGatekeeperProxy.kt`):**
+   - `VpnTunnelState.Connected` strictly enforces non-null `network: Network` and monotonic `generation: Long`.
+   - Enforced `connectivityManager.bindProcessToNetwork(network)` on connect and `bindProcessToNetwork(null)` on disconnect.
+   - Replaced asynchronous `StateFlow.collect` in the proxy with a synchronous `TunnelListener` invoked under `stateLock`.
+   - Outbound sockets tracked with generation: `outboundSockets: ConcurrentHashMap<Socket, Long>`. Outdated sockets are closed immediately on VPN handover.
+   - Outbound `network.bindSocket(outbound)` is mandatory (fail-closed, no silent fallback).
 
-4. **Криптография и защита Keystore:**
-   - Оцени `AccountCookieJarFallback.kt`: генерация ключа в `AndroidKeyStore`, 12-байтный IV, проверка аутентификационного тега GCM, надёжность сериализации.
+4. **Dedicated Scheduled Watchdog, True SWR & Single-Flight TCP DNS (`TunnelDnsResolver.kt`):**
+   - Watchdog converted to `watchdogExecutor: ScheduledExecutorService` (`newSingleThreadScheduledExecutor`) — cannot be delayed by coroutine pool starvation.
+   - Single-Flight request deduplication via `inFlightQueries: ConcurrentHashMap<String, Deferred<Inet4Address?>>` prevents query storms.
+   - True Stale-While-Revalidate: serves stale IP immediately if expired and refreshes in background via `dnsScope.launch { executeNetworkResolve(...) }`.
+   - Stale cache preserved across VPN disconnects (`clearCache(clearStale = false)`).
+   - QNAME validation and randomized IP selection across multiple A-records.
 
-5. **Утечки памяти и стабильность сессий (8+ часов):**
-   - Где в кодовой базе наиболее вероятны утечки памяти при долгой непрерывной работе пользователя с тяжелыми SPA-приложениями и WebSocket?
+5. **AndroidKeyStore Crypto Hardening & Robust JSON (`AccountCookieJarFallback.kt`, `AccountProfileJsonCodec.kt`):**
+   - Removed caller-provided IV. Let `AndroidKeyStore` generate random IV during `cipher.init(Cipher.ENCRYPT_MODE, secretKey)` and read `cipher.iv`.
+   - Bound profile ID to GCM AAD (`cipher.updateAAD(profileId.toByteArray())`) to prevent cross-profile swapping.
+   - Migrated profile JSON parsing from regex to robust `org.json.JSONArray` / `JSONObject`.
+   - Switching away from active profile before deletion in `AccountProfileManager`.
 
-6. **Конкретный план улучшений и код:**
-   - Предоставь готовые, проверенные фрагменты кода на Kotlin и JavaScript для устранения найденных узких мест.
+6. **WebView Anti-Bypass & DOM Stealth (`MainActivity.kt`, `AntiFingerprintHardener.kt`):**
+   - Added `.removeImplicitRules()` to `ProxyConfig.Builder()` to prevent Chromium loopback bypass.
+   - Disabled Google Safe Browsing telemetry bypass (`WebSettingsCompat.setSafeBrowsingEnabled(settings, false)`).
+   - Implemented `onRenderProcessGone` recovery in `WebViewClient`.
+   - Enforced strict origin validation in `EnclaveDownload` bridge.
+   - Offscreen Canvas Farbling: temporary canvas clone (`document.createElement('canvas')`) during `toDataURL` and `toBlob` prevents source canvas destruction.
+   - `Function.prototype.toString` cloaking via `WeakMap` returning `function name() { [native code] }`.
+   - Patched `SpeechSynthesis.prototype.getVoices` in addition to `window.speechSynthesis`.
+
+---
+
+### YOUR VERIFICATION TASK
+Review the updated codebase in `ENTERPRISE_PORTAL_AUDIT_PACKAGE.md`:
+1. Verify whether all previously identified P0 vulnerabilities are completely mitigated.
+2. Search for any subtle edge cases, kernel networking nuances (Android 14/15/16/17), or concurrency race conditions in the new architecture.
+3. Assess overall enterprise readiness for deployment.
+```
+
+### Русская версия:
+
+```markdown
+# ЗАДАЧА: ВЕРИФИКАЦИЯ ЭТАПА STAGE 10 (ZERO-TRUST АУДИТ ПОСЛЕ РЕМЕДИАЦИИ)
+
+Ты ранее провёл архитектурный аудит контейнера **`EnclaveShield`** (`com.corp.enclaveshield`) и выявил ряд критических уязвимостей: открытый SOCKS5-прокси на loopback, голодание пула `Dispatchers.IO`, сбои kill-switch при handover, ошибку Keystore с клиентским IV, отсутствие проверки origin в JS-мосте и порчу Canvas.
+
+Мы провели полный рефакторинг **Stage 10 (Zero-Trust Production Hardening)**. Обновлённый пакет исходного кода прикреплён в файле `ENTERPRISE_PORTAL_AUDIT_PACKAGE.md`.
+
+Проверь кодовую базу:
+1. Подтверди устранение всех P0-уязвимостей (Destination Allowlist, Private IP filter, выделенный cached thread pool для релея, generational socket tracking, Scheduled watchdog, True SWR DNS, безопасный Keystore AES-GCM, offscreen canvas farbling, removeImplicitRules).
+2. Оцени наличие скрытых краевых эффектов или гонок в обновлённом коде.
 ```

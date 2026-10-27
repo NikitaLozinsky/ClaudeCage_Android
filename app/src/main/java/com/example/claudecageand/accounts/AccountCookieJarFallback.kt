@@ -71,11 +71,12 @@ class AccountCookieJarFallback(
         }
     }
 
-    fun encrypt(plaintext: String): String {
+    fun encrypt(profileId: String, plaintext: String): String {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        val iv = ByteArray(12)
-        SecureRandom().nextBytes(iv)
-        cipher.init(Cipher.ENCRYPT_MODE, secretKey, GCMParameterSpec(128, iv))
+        // Initialize without IV: AndroidKeyStore generates random IV under setRandomizedEncryptionRequired(true)
+        cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+        val iv = cipher.iv ?: error("Cipher failed to generate IV")
+        cipher.updateAAD(profileId.toByteArray(Charsets.UTF_8))
         val ciphertext = cipher.doFinal(plaintext.toByteArray(Charsets.UTF_8))
         val combined = ByteArray(iv.size + ciphertext.size)
         System.arraycopy(iv, 0, combined, 0, iv.size)
@@ -83,7 +84,9 @@ class AccountCookieJarFallback(
         return Base64.getEncoder().encodeToString(combined)
     }
 
-    fun decrypt(encryptedBase64: String): String? {
+    fun encrypt(plaintext: String): String = encrypt("", plaintext)
+
+    fun decrypt(profileId: String, encryptedBase64: String): String? {
         return runCatching {
             val combined = Base64.getDecoder().decode(encryptedBase64)
             if (combined.size < 12) return null
@@ -91,19 +94,22 @@ class AccountCookieJarFallback(
             val ciphertext = combined.copyOfRange(12, combined.size)
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(128, iv))
+            cipher.updateAAD(profileId.toByteArray(Charsets.UTF_8))
             val decrypted = cipher.doFinal(ciphertext)
             String(decrypted, Charsets.UTF_8)
         }.getOrNull()
     }
 
+    fun decrypt(encryptedBase64: String): String? = decrypt("", encryptedBase64)
+
     fun saveCookies(profileId: String, cookieString: String) {
-        val encrypted = encrypt(cookieString)
+        val encrypted = encrypt(profileId, cookieString)
         prefs.edit().putString(KEY_COOKIE_PREFIX + profileId, encrypted).apply()
     }
 
     fun getCookies(profileId: String): String? {
         val encrypted = prefs.getString(KEY_COOKIE_PREFIX + profileId, null) ?: return null
-        return decrypt(encrypted)
+        return decrypt(profileId, encrypted)
     }
 
     fun deleteCookies(profileId: String) {

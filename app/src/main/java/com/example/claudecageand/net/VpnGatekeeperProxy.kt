@@ -12,6 +12,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.asCoroutineDispatcher
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.IOException
@@ -26,7 +27,9 @@ import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -65,6 +68,12 @@ class VpnGatekeeperProxy(
     private val proxyJob = SupervisorJob()
     private val proxyScope = CoroutineScope(Dispatchers.IO + proxyJob)
 
+    // Dedicated cached thread pool for relay traffic so blocking read() never starves Dispatchers.IO
+    private val relayExecutor = Executors.newCachedThreadPool { runnable ->
+        Thread(runnable, "VpnProxyRelay").apply { isDaemon = true }
+    }
+    private val relayDispatcher = relayExecutor.asCoroutineDispatcher()
+
     // Bind strictly to loopback 127.0.0.1 on an ephemeral dynamic port (port 0)
     private val serverSocket: ServerSocket = ServerSocket(
         0,
@@ -76,7 +85,41 @@ class VpnGatekeeperProxy(
 
     // Thread-safe pool of all active client and outbound sockets
     private val activeSockets = ConcurrentHashMap.newKeySet<Socket>()
+    // Tracks outbound sockets mapped to the tunnel generation at time of creation
+    private val outboundSockets = ConcurrentHashMap<Socket, Long>()
     private val isRunning = AtomicBoolean(false)
+
+    // Synchronous tunnel listener for instant kill-switch and handover tracking
+    private val tunnelListener = TunnelListener { _, current ->
+        when (current) {
+            is VpnTunnelState.Connected -> {
+                val curGen = current.generation
+                val it = outboundSockets.entries.iterator()
+                var killed = 0
+                while (it.hasNext()) {
+                    val entry = it.next()
+                    if (entry.value != curGen) {
+                        it.remove()
+                        activeSockets.remove(entry.key)
+                        runCatching { entry.key.close() }
+                        killed++
+                    }
+                }
+                if (killed > 0) {
+                    auditLogger?.log(
+                        LogCategory.KILLSWITCH,
+                        LogLevel.BLOCK,
+                        "Killed $killed outdated socket(s) on tunnel handover (gen $curGen)"
+                    )
+                    Log.w(TAG, "Killed $killed outdated socket(s) on tunnel handover (gen $curGen)")
+                }
+            }
+            is VpnTunnelState.Disconnected -> {
+                closeAllActiveSockets()
+                dnsResolver.clearCache()
+            }
+        }
+    }
 
     /**
      * Starts the SOCKS5 proxy server and begins observing VPN state transitions.
@@ -86,17 +129,7 @@ class VpnGatekeeperProxy(
         Log.i(TAG, "Starting VpnGatekeeperProxy on 127.0.0.1:$listeningPort")
         auditLogger?.log(LogCategory.PROXY, LogLevel.INFO, "SOCKS5 Proxy started on 127.0.0.1:$listeningPort")
 
-        // Observe VPN state changes for instant fail-closed socket termination
-        proxyScope.launch {
-            vpnStateMonitor.vpnState.collect { state ->
-                if (state is VpnTunnelState.Disconnected) {
-                    Log.w(TAG, "VPN Disconnected! Executing fail-closed termination of all active sockets.")
-                    auditLogger?.log(LogCategory.KILLSWITCH, LogLevel.BLOCK, "VPN drop detected! Triggering kill-switch on all sockets")
-                    closeAllActiveSockets()
-                    dnsResolver.clearCache()
-                }
-            }
-        }
+        vpnStateMonitor.addTunnelListener(tunnelListener)
 
         // Accept loop
         proxyScope.launch {
@@ -111,10 +144,12 @@ class VpnGatekeeperProxy(
         if (!isRunning.compareAndSet(true, false)) return
         Log.i(TAG, "Stopping VpnGatekeeperProxy on 127.0.0.1:$listeningPort")
         auditLogger?.log(LogCategory.PROXY, LogLevel.INFO, "SOCKS5 Proxy stopping")
+        vpnStateMonitor.removeTunnelListener(tunnelListener)
         runCatching { serverSocket.close() }
         closeAllActiveSockets()
         dnsResolver.clearCache()
         proxyJob.cancel()
+        relayExecutor.shutdownNow()
     }
 
     /**
@@ -125,7 +160,7 @@ class VpnGatekeeperProxy(
      * and an [IOException] is thrown to prevent any race-condition network leaks.
      */
     @Throws(IOException::class)
-    fun registerSocketOrThrow(socket: Socket): VpnTunnelState.Connected {
+    fun registerSocketOrThrow(socket: Socket, isOutbound: Boolean = false): VpnTunnelState.Connected {
         activeSockets.add(socket)
         auditLogger?.activeSocketsCount?.set(activeSockets.size)
 
@@ -137,6 +172,9 @@ class VpnGatekeeperProxy(
             auditLogger?.log(LogCategory.KILLSWITCH, LogLevel.BLOCK, "Socket registration aborted: VPN is disconnected")
             throw IOException("VPN disconnected during socket registration")
         }
+        if (isOutbound) {
+            outboundSockets[socket] = current.generation
+        }
         return current
     }
 
@@ -144,6 +182,7 @@ class VpnGatekeeperProxy(
      * Immediately and forcefully closes all active sockets in the pool.
      */
     fun closeAllActiveSockets() {
+        outboundSockets.clear()
         val iterator = activeSockets.iterator()
         var closedCount = 0
         while (iterator.hasNext()) {
@@ -183,6 +222,21 @@ class VpnGatekeeperProxy(
                 Log.e(TAG, "Error in SOCKS5 accept loop", e)
             }
         }
+    }
+
+    private fun isForbiddenIp(ip: Inet4Address, vpnTunnel: VpnTunnelState?): Boolean {
+        if (ip.isLoopbackAddress || ip.isLinkLocalAddress || ip.isSiteLocalAddress || ip.isMulticastAddress || ip.isAnyLocalAddress) {
+            return true
+        }
+        if (vpnTunnel is VpnTunnelState.Connected && ip == vpnTunnel.tunIpv4) {
+            return true
+        }
+        return false
+    }
+
+    private fun isDomainAllowed(domain: String): Boolean {
+        val clean = domain.trim().trimEnd('.').lowercase(Locale.ROOT)
+        return ALLOWED_DOMAIN_SUFFIXES.any { clean == it || clean.endsWith(".$it") }
     }
 
     private suspend fun handleClient(clientSocket: Socket) = withContext(Dispatchers.IO) {
@@ -249,14 +303,27 @@ class VpnGatekeeperProxy(
                     val ipBytes = ByteArray(4)
                     dis.readFully(ipBytes)
                     targetPort = dis.readUnsignedShort()
-                    targetIp = InetAddress.getByAddress(ipBytes) as Inet4Address
+                    val rawIp = InetAddress.getByAddress(ipBytes) as Inet4Address
+                    val currentTunnel = vpnStateMonitor.getCurrentTunnelState()
+                    if (isForbiddenIp(rawIp, currentTunnel)) {
+                        Log.w(TAG, "Fail-closed rule: Blocked forbidden IPv4 destination: $rawIp")
+                        auditLogger?.log(
+                            LogCategory.SECURITY,
+                            LogLevel.BLOCK,
+                            "Blocked forbidden IPv4 destination: $rawIp"
+                        )
+                        sendSocks5Reply(dos, REP_CONN_REFUSED)
+                        return@withContext
+                    }
+                    targetIp = rawIp
                 }
                 ATYP_DOMAIN -> {
                     val domainLength = dis.readUnsignedByte()
                     val domainBytes = ByteArray(domainLength)
                     dis.readFully(domainBytes)
                     targetPort = dis.readUnsignedShort()
-                    var domain = String(domainBytes, Charsets.US_ASCII).trim()
+                    val rawDomain = String(domainBytes, Charsets.US_ASCII).trim()
+                    var domain = rawDomain.trimEnd('.').lowercase(Locale.ROOT)
 
                     // Strip square brackets if present (e.g. [2604:a880:...])
                     if (domain.startsWith("[") && domain.endsWith("]")) {
@@ -276,16 +343,8 @@ class VpnGatekeeperProxy(
                         return@withContext
                     }
 
-                    // Regional Domain Guard (Stage 9)
-                    if (domain == "google.ru") {
-                        domain = "google.com"
-                        auditLogger?.log(
-                            LogCategory.SECURITY,
-                            LogLevel.INFO,
-                            "Rewrote regional domain to $domain"
-                        )
-                        Log.i(TAG, "Rewrote regional domain to $domain")
-                    } else if (domain.endsWith(".google.ru")) {
+                    // Regional Domain Guard (Stage 9 & 10)
+                    if (domain == "google.ru" || domain.endsWith(".google.ru")) {
                         domain = domain.removeSuffix(".google.ru") + ".google.com"
                         auditLogger?.log(
                             LogCategory.SECURITY,
@@ -299,6 +358,18 @@ class VpnGatekeeperProxy(
                             LogCategory.SECURITY,
                             LogLevel.BLOCK,
                             "Blocked regional CIS domain: $domain"
+                        )
+                        sendSocks5Reply(dos, REP_CONN_REFUSED)
+                        return@withContext
+                    }
+
+                    // Destination Allowlist Guard (P0 Remediation)
+                    if (!isDomainAllowed(domain)) {
+                        Log.w(TAG, "Fail-closed rule: Blocked non-allowlisted destination domain: $domain")
+                        auditLogger?.log(
+                            LogCategory.SECURITY,
+                            LogLevel.BLOCK,
+                            "Blocked non-allowlisted destination domain: $domain"
                         )
                         sendSocks5Reply(dos, REP_CONN_REFUSED)
                         return@withContext
@@ -363,7 +434,7 @@ class VpnGatekeeperProxy(
             outbound.keepAlive = true
 
             val currentTunnelState = try {
-                registerSocketOrThrow(outbound)
+                registerSocketOrThrow(outbound, isOutbound = true)
             } catch (e: Exception) {
                 Log.w(TAG, "Fail-closed: Connection refused to $targetIp:$targetPort, VPN is DISCONNECTED")
                 auditLogger?.blockedVpnOffCount?.incrementAndGet()
@@ -373,17 +444,16 @@ class VpnGatekeeperProxy(
 
             // --- Step 4: Bind Outbound Socket to VPN ---
             try {
-                // Attempt Android Network binding FIRST if handle is available
-                if (currentTunnelState.network != null) {
-                    runCatching { currentTunnelState.network.bindSocket(outbound) }
-                }
+                // Critical Zero-Trust Fix: Android Network binding is mandatory
+                currentTunnelState.network.bindSocket(outbound)
 
                 // Kernel-level fail-closed enforcement: bind socket to tunnel's local IPv4
                 outbound.bind(InetSocketAddress(currentTunnelState.tunIpv4, 0))
 
                 // Check again right before TCP SYN to defeat any microsecond races
-                if (vpnStateMonitor.getCurrentTunnelState() !is VpnTunnelState.Connected) {
-                    throw IOException("VPN dropped right before outbound connect")
+                val verifiedTunnel = vpnStateMonitor.getCurrentTunnelState()
+                if (verifiedTunnel !is VpnTunnelState.Connected || verifiedTunnel.generation != currentTunnelState.generation) {
+                    throw IOException("VPN state or generation changed right before outbound connect")
                 }
 
                 outbound.connect(InetSocketAddress(targetIp, targetPort), OUTBOUND_CONNECT_TIMEOUT_MS)
@@ -421,6 +491,7 @@ class VpnGatekeeperProxy(
             activeSockets.remove(clientSocket)
             if (remoteSocket != null) {
                 activeSockets.remove(remoteSocket)
+                outboundSockets.remove(remoteSocket)
                 runCatching { remoteSocket.close() }
             }
             runCatching { clientSocket.close() }
@@ -428,26 +499,24 @@ class VpnGatekeeperProxy(
         }
     }
 
-    private suspend fun relayTraffic(clientSocket: Socket, remoteSocket: Socket) = withContext(Dispatchers.IO) {
+    private suspend fun relayTraffic(clientSocket: Socket, remoteSocket: Socket) = withContext(relayDispatcher) {
         val clientIn = clientSocket.getInputStream()
         val clientOut = clientSocket.getOutputStream()
         val remoteIn = remoteSocket.getInputStream()
         val remoteOut = remoteSocket.getOutputStream()
 
-        val jobClientToRemote = launch(Dispatchers.IO) {
+        val jobClientToRemote = launch(relayDispatcher) {
             pipe(clientIn, remoteOut) { bytes ->
                 auditLogger?.totalBytesSent?.addAndGet(bytes)
             }
             runCatching { remoteSocket.shutdownOutput() }
-            runCatching { clientSocket.close() }
         }
 
-        val jobRemoteToClient = launch(Dispatchers.IO) {
+        val jobRemoteToClient = launch(relayDispatcher) {
             pipe(remoteIn, clientOut) { bytes ->
                 auditLogger?.totalBytesReceived?.addAndGet(bytes)
             }
             runCatching { clientSocket.shutdownOutput() }
-            runCatching { remoteSocket.close() }
         }
 
         joinAll(jobClientToRemote, jobRemoteToClient)
@@ -527,5 +596,17 @@ class VpnGatekeeperProxy(
         private const val REP_CONN_REFUSED = 0x05.toByte()
         private const val REP_CMD_NOT_SUPPORTED = 0x07.toByte()
         private const val REP_ADDR_TYPE_NOT_SUPPORTED = 0x08.toByte()
+
+        val ALLOWED_DOMAIN_SUFFIXES = setOf(
+            "claude.ai",
+            "anthropic.com",
+            "intercom.io",
+            "statsig.com",
+            "browserleaks.com",
+            "google.com",
+            "gstatic.com",
+            "googleapis.com",
+            "appleid.apple.com"
+        )
     }
 }

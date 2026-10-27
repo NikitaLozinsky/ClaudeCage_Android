@@ -224,4 +224,61 @@ class TunnelDnsResolverTest {
         assertEquals(0, resolver.negativeCacheSize)
         assertEquals(0, resolver.staleCacheSize)
     }
+
+    @Test
+    fun clearCache_withPreserveStale_keepsStaleEntries() {
+        val resolver = TunnelDnsResolver()
+        val staleIp = java.net.InetAddress.getByAddress(byteArrayOf(104, 18, 2, 3)) as java.net.Inet4Address
+        resolver.putStaleEntryForTesting("claude.ai", staleIp)
+        assertEquals(1, resolver.staleCacheSize)
+
+        resolver.clearCache(clearStale = false)
+        assertEquals(1, resolver.staleCacheSize)
+    }
+
+    @Test
+    fun parseTcpDnsResponse_multipleArecords_picksOne() {
+        val queryId = 0x3333
+        val out = ByteArrayOutputStream()
+        val header = ByteBuffer.allocate(12).order(ByteOrder.BIG_ENDIAN)
+        header.putShort(queryId.toShort())
+        header.putShort(0x8180.toShort())
+        header.putShort(1.toShort())      // QDCOUNT
+        header.putShort(2.toShort())      // ANCOUNT = 2
+        header.putShort(0.toShort())
+        header.putShort(0.toShort())
+        out.write(header.array())
+
+        // Question
+        out.write(byteArrayOf(6, 'c'.code.toByte(), 'l'.code.toByte(), 'a'.code.toByte(), 'u'.code.toByte(), 'd'.code.toByte(), 'e'.code.toByte(), 2, 'a'.code.toByte(), 'i'.code.toByte(), 0))
+        val qtail = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
+        qtail.putShort(1.toShort())
+        qtail.putShort(1.toShort())
+        out.write(qtail.array())
+
+        // Answer 1: 104.18.2.3
+        out.write(byteArrayOf(0xC0.toByte(), 0x0C.toByte()))
+        val a1 = ByteBuffer.allocate(10).order(ByteOrder.BIG_ENDIAN)
+        a1.putShort(1.toShort())
+        a1.putShort(1.toShort())
+        a1.putInt(300)
+        a1.putShort(4.toShort())
+        out.write(a1.array())
+        out.write(byteArrayOf(104, 18, 2, 3))
+
+        // Answer 2: 104.18.3.4
+        out.write(byteArrayOf(0xC0.toByte(), 0x0C.toByte()))
+        val a2 = ByteBuffer.allocate(10).order(ByteOrder.BIG_ENDIAN)
+        a2.putShort(1.toShort())
+        a2.putShort(1.toShort())
+        a2.putInt(300)
+        a2.putShort(4.toShort())
+        out.write(a2.array())
+        out.write(byteArrayOf(104, 18, 3, 4))
+
+        val parsed = TunnelDnsResolver.parseTcpDnsResponse(out.toByteArray(), queryId)
+        assertNotNull(parsed.address)
+        val picked = parsed.address!!.hostAddress
+        assertTrue(picked == "104.18.2.3" || picked == "104.18.3.4")
+    }
 }

@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * Sealed interface representing the state of the active VPN tunnel.
@@ -23,10 +24,24 @@ sealed interface VpnTunnelState {
     data object Disconnected : VpnTunnelState
 
     data class Connected(
-        val network: Network?,
+        val network: Network,
         val interfaceName: String,
-        val tunIpv4: Inet4Address
-    ) : VpnTunnelState
+        val tunIpv4: Inet4Address,
+        val generation: Long = 0L
+    ) : VpnTunnelState {
+        fun sameTunnel(other: Connected): Boolean {
+            return network == other.network &&
+                    interfaceName == other.interfaceName &&
+                    tunIpv4 == other.tunIpv4
+        }
+    }
+}
+
+/**
+ * Synchronous listener for instant fail-closed tunnel transitions and handover handling.
+ */
+fun interface TunnelListener {
+    fun onTunnelChanged(previous: VpnTunnelState, current: VpnTunnelState)
 }
 
 /**
@@ -49,6 +64,16 @@ class VpnStateMonitor(
     val vpnState: StateFlow<VpnTunnelState> = _vpnState.asStateFlow()
 
     private var isRegistered = false
+    private var currentGeneration = 0L
+    private val tunnelListeners = CopyOnWriteArrayList<TunnelListener>()
+
+    fun addTunnelListener(listener: TunnelListener) {
+        tunnelListeners.add(listener)
+    }
+
+    fun removeTunnelListener(listener: TunnelListener) {
+        tunnelListeners.remove(listener)
+    }
 
     // Critical Android API rule: default NetworkRequest filters out VPNs.
     // Explicitly add TRANSPORT_VPN and remove NET_CAPABILITY_NOT_VPN.
@@ -92,12 +117,43 @@ class VpnStateMonitor(
     init {
         // Trigger an immediate state check on initialization so the app knows at launch
         // whether VPN is ON or OFF before the first callback fires.
-        synchronized(stateLock) {
-            val initialState = scanActiveVpn()
-            _vpnState.value = initialState
-            recordStateTelemetry(initialState)
-        }
+        val initialState = scanActiveVpn()
+        publishState(initialState)
         startMonitoring()
+    }
+
+    /**
+     * Publishes tunnel state synchronously under [stateLock], updating generation,
+     * binding or unbinding process network via [ConnectivityManager.bindProcessToNetwork],
+     * and immediately notifying all [TunnelListener]s.
+     */
+    private fun publishState(next: VpnTunnelState) {
+        synchronized(stateLock) {
+            val prev = _vpnState.value
+            if (next is VpnTunnelState.Connected) {
+                if (prev is VpnTunnelState.Connected && prev.sameTunnel(next)) {
+                    return
+                }
+                currentGeneration++
+                val updated = next.copy(generation = currentGeneration)
+                _vpnState.value = updated
+                recordStateTelemetry(updated)
+                runCatching { connectivityManager.bindProcessToNetwork(updated.network) }
+                for (listener in tunnelListeners) {
+                    runCatching { listener.onTunnelChanged(prev, updated) }
+                }
+            } else {
+                if (prev is VpnTunnelState.Disconnected) {
+                    return
+                }
+                _vpnState.value = VpnTunnelState.Disconnected
+                recordStateTelemetry(VpnTunnelState.Disconnected)
+                runCatching { connectivityManager.bindProcessToNetwork(null) }
+                for (listener in tunnelListeners) {
+                    runCatching { listener.onTunnelChanged(prev, VpnTunnelState.Disconnected) }
+                }
+            }
+        }
     }
 
     /**
@@ -111,8 +167,7 @@ class VpnStateMonitor(
                 connectivityManager.registerNetworkCallback(request, networkCallback)
                 isRegistered = true
                 val scanned = scanActiveVpn()
-                _vpnState.value = scanned
-                recordStateTelemetry(scanned)
+                publishState(scanned)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to register VPN NetworkCallback", e)
             }
@@ -131,6 +186,7 @@ class VpnStateMonitor(
                 Log.e(TAG, "Failed to unregister VPN NetworkCallback", e)
             } finally {
                 isRegistered = false
+                publishState(VpnTunnelState.Disconnected)
             }
         }
     }
@@ -146,13 +202,8 @@ class VpnStateMonitor(
             if (current is VpnTunnelState.Connected) {
                 val isStillAlive = isInterfaceUpAndHoldsAddress(current.interfaceName, current.tunIpv4)
                 if (isStillAlive) {
-                    if (current.network != null) {
-                        val caps = connectivityManager.getNetworkCapabilities(current.network)
-                        if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) {
-                            return current
-                        }
-                    } else {
-                        // Interface is physically up and holds IPv4
+                    val caps = connectivityManager.getNetworkCapabilities(current.network)
+                    if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) {
                         return current
                     }
                 }
@@ -160,41 +211,27 @@ class VpnStateMonitor(
 
             // If disconnected or the previous interface died, perform an immediate scan
             val freshState = scanActiveVpn()
-            if (_vpnState.value != freshState) {
-                _vpnState.value = freshState
-                recordStateTelemetry(freshState)
-            }
-            return freshState
+            publishState(freshState)
+            return _vpnState.value
         }
     }
 
     private fun handleNetworkUpdate(network: Network, linkProperties: LinkProperties? = null) {
-        synchronized(stateLock) {
-            val evaluated = evaluateNetwork(network, linkProperties)
-            if (evaluated is VpnTunnelState.Connected) {
-                if (_vpnState.value != evaluated) {
-                    _vpnState.value = evaluated
-                    recordStateTelemetry(evaluated)
-                }
-            } else {
-                val current = _vpnState.value
-                if (current is VpnTunnelState.Connected && current.network == network) {
-                    val fresh = scanActiveVpn()
-                    _vpnState.value = fresh
-                    recordStateTelemetry(fresh)
-                }
+        val evaluated = evaluateNetwork(network, linkProperties)
+        if (evaluated is VpnTunnelState.Connected) {
+            publishState(evaluated)
+        } else {
+            val current = _vpnState.value
+            if (current is VpnTunnelState.Connected && current.network == network) {
+                publishState(scanActiveVpn())
             }
         }
     }
 
     private fun handleNetworkLost(network: Network) {
-        synchronized(stateLock) {
-            val current = _vpnState.value
-            if (current is VpnTunnelState.Connected && current.network == network) {
-                val fresh = scanActiveVpn()
-                _vpnState.value = fresh
-                recordStateTelemetry(fresh)
-            }
+        val current = _vpnState.value
+        if (current is VpnTunnelState.Connected && current.network == network) {
+            publishState(scanActiveVpn())
         }
     }
 
@@ -270,17 +307,21 @@ class VpnStateMonitor(
                 for (network in getAllNetworks()) {
                     val lp = connectivityManager.getLinkProperties(network)
                     if (lp?.interfaceName == fallback.first) {
-                        matchedNetwork = network
-                        break
+                        val caps = connectivityManager.getNetworkCapabilities(network)
+                        if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) {
+                            matchedNetwork = network
+                            break
+                        }
                     }
                 }
 
-                // Crucial One UI 9 fix: return Connected even if allNetworks did not expose the Network object
-                return VpnTunnelState.Connected(
-                    network = matchedNetwork,
-                    interfaceName = fallback.first,
-                    tunIpv4 = fallback.second
-                )
+                if (matchedNetwork != null) {
+                    return VpnTunnelState.Connected(
+                        network = matchedNetwork,
+                        interfaceName = fallback.first,
+                        tunIpv4 = fallback.second
+                    )
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error scanning for active VPN", e)

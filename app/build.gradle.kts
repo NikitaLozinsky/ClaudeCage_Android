@@ -75,6 +75,7 @@ dependencies {
 
     testImplementation(libs.junit)
     testImplementation(libs.mockito.core)
+    testImplementation("org.json:json:20240303")
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
 }

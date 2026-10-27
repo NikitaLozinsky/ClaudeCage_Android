@@ -250,4 +250,133 @@ class VpnGatekeeperProxyTest {
             monitor.stopMonitoring()
         }
     }
+
+    @Test
+    fun rejectsUppercaseAndDottedCisDomains() {
+        val monitor = VpnStateMonitor(mockContext, mockConnectivityManager)
+        val proxy = VpnGatekeeperProxy(mockContext, monitor)
+        proxy.start()
+
+        try {
+            val loopback = InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
+            val client = Socket(loopback, proxy.listeningPort)
+            client.soTimeout = 3000
+
+            val dos = DataOutputStream(client.getOutputStream())
+            val dis = DataInputStream(client.getInputStream())
+
+            dos.write(byteArrayOf(0x05, 0x01, 0x00))
+            dos.flush()
+            assertEquals(5, dis.readUnsignedByte())
+            assertEquals(0, dis.readUnsignedByte())
+
+            val ruDomain = "YANDEX.RU.".toByteArray(Charsets.US_ASCII)
+            val request = ByteArray(4 + 1 + ruDomain.size + 2)
+            request[0] = 0x05
+            request[1] = 0x01
+            request[2] = 0x00
+            request[3] = 0x03
+            request[4] = ruDomain.size.toByte()
+            System.arraycopy(ruDomain, 0, request, 5, ruDomain.size)
+            request[request.size - 2] = 0x01
+            request[request.size - 1] = 0xBB.toByte()
+
+            dos.write(request)
+            dos.flush()
+
+            val repVer = dis.readUnsignedByte()
+            val repCode = dis.readUnsignedByte()
+            assertEquals(5, repVer)
+            assertEquals(0x05, repCode)
+
+            client.close()
+        } finally {
+            proxy.stop()
+            monitor.stopMonitoring()
+        }
+    }
+
+    @Test
+    fun rejectsNonAllowlistedDomainWithConnectionRefused() {
+        val monitor = VpnStateMonitor(mockContext, mockConnectivityManager)
+        val proxy = VpnGatekeeperProxy(mockContext, monitor)
+        proxy.start()
+
+        try {
+            val loopback = InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
+            val client = Socket(loopback, proxy.listeningPort)
+            client.soTimeout = 3000
+
+            val dos = DataOutputStream(client.getOutputStream())
+            val dis = DataInputStream(client.getInputStream())
+
+            dos.write(byteArrayOf(0x05, 0x01, 0x00))
+            dos.flush()
+            assertEquals(5, dis.readUnsignedByte())
+            assertEquals(0, dis.readUnsignedByte())
+
+            val evilDomain = "attacker.example.org".toByteArray(Charsets.US_ASCII)
+            val request = ByteArray(4 + 1 + evilDomain.size + 2)
+            request[0] = 0x05
+            request[1] = 0x01
+            request[2] = 0x00
+            request[3] = 0x03
+            request[4] = evilDomain.size.toByte()
+            System.arraycopy(evilDomain, 0, request, 5, evilDomain.size)
+            request[request.size - 2] = 0x01
+            request[request.size - 1] = 0xBB.toByte()
+
+            dos.write(request)
+            dos.flush()
+
+            val repVer = dis.readUnsignedByte()
+            val repCode = dis.readUnsignedByte()
+            assertEquals(5, repVer)
+            assertEquals(0x05, repCode)
+
+            client.close()
+        } finally {
+            proxy.stop()
+            monitor.stopMonitoring()
+        }
+    }
+
+    @Test
+    fun rejectsForbiddenLoopbackAndPrivateIpv4() {
+        val monitor = VpnStateMonitor(mockContext, mockConnectivityManager)
+        val proxy = VpnGatekeeperProxy(mockContext, monitor)
+        proxy.start()
+
+        try {
+            val loopback = InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
+            val client = Socket(loopback, proxy.listeningPort)
+            client.soTimeout = 3000
+
+            val dos = DataOutputStream(client.getOutputStream())
+            val dis = DataInputStream(client.getInputStream())
+
+            dos.write(byteArrayOf(0x05, 0x01, 0x00))
+            dos.flush()
+            assertEquals(5, dis.readUnsignedByte())
+            assertEquals(0, dis.readUnsignedByte())
+
+            // Try connecting to 127.0.0.1:8080 via ATYP_IPV4
+            dos.write(byteArrayOf(
+                0x05, 0x01, 0x00, 0x01,
+                127.toByte(), 0.toByte(), 0.toByte(), 1.toByte(),
+                0x1F, 0x90.toByte() // 8080
+            ))
+            dos.flush()
+
+            val repVer = dis.readUnsignedByte()
+            val repCode = dis.readUnsignedByte()
+            assertEquals(5, repVer)
+            assertEquals(0x05, repCode) // REP_CONN_REFUSED
+
+            client.close()
+        } finally {
+            proxy.stop()
+            monitor.stopMonitoring()
+        }
+    }
 }

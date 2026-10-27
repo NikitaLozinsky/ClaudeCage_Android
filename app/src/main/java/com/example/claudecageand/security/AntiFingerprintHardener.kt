@@ -31,45 +31,79 @@ object AntiFingerprintHardener {
                 const NOISE_OFFSET = $noiseOffset;
 
                 const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-                CanvasRenderingContext2D.prototype.getImageData = function(sx, sy, sw, sh, settings) {
+                CanvasRenderingContext2D.prototype.getImageData = cloak(function(sx, sy, sw, sh, settings) {
                     const imgData = origGetImageData.call(this, sx, sy, sw, sh, settings);
                     if (imgData && imgData.data && imgData.data.length >= 4) {
                         imgData.data[0] = (imgData.data[0] + NOISE_OFFSET) % 256;
                     }
                     return imgData;
-                };
+                }, 'getImageData');
 
                 const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-                HTMLCanvasElement.prototype.toDataURL = function(type, encoderOptions) {
+                HTMLCanvasElement.prototype.toDataURL = cloak(function(type, encoderOptions) {
                     try {
-                        const ctx = this.getContext('2d');
-                        if (ctx && this.width > 0 && this.height > 0) {
-                            const pixel = origGetImageData.call(ctx, 0, 0, 1, 1);
-                            pixel.data[0] = (pixel.data[0] + NOISE_OFFSET) % 256;
-                            ctx.putImageData(pixel, 0, 0);
+                        if (this.width > 0 && this.height > 0) {
+                            const offscreen = document.createElement('canvas');
+                            offscreen.width = this.width;
+                            offscreen.height = this.height;
+                            const offCtx = offscreen.getContext('2d');
+                            if (offCtx) {
+                                offCtx.drawImage(this, 0, 0);
+                                const pixel = origGetImageData.call(offCtx, 0, 0, 1, 1);
+                                if (pixel && pixel.data && pixel.data.length >= 4) {
+                                    pixel.data[0] = (pixel.data[0] + NOISE_OFFSET) % 256;
+                                    offCtx.putImageData(pixel, 0, 0);
+                                }
+                                return origToDataURL.call(offscreen, type, encoderOptions);
+                            }
                         }
                     } catch (e) {}
                     return origToDataURL.call(this, type, encoderOptions);
-                };
+                }, 'toDataURL');
 
                 const origToBlob = HTMLCanvasElement.prototype.toBlob;
-                HTMLCanvasElement.prototype.toBlob = function(callback, type, quality) {
+                HTMLCanvasElement.prototype.toBlob = cloak(function(callback, type, quality) {
                     try {
-                        const ctx = this.getContext('2d');
-                        if (ctx && this.width > 0 && this.height > 0) {
-                            const pixel = origGetImageData.call(ctx, 0, 0, 1, 1);
-                            pixel.data[0] = (pixel.data[0] + NOISE_OFFSET) % 256;
-                            ctx.putImageData(pixel, 0, 0);
+                        if (this.width > 0 && this.height > 0) {
+                            const offscreen = document.createElement('canvas');
+                            offscreen.width = this.width;
+                            offscreen.height = this.height;
+                            const offCtx = offscreen.getContext('2d');
+                            if (offCtx) {
+                                offCtx.drawImage(this, 0, 0);
+                                const pixel = origGetImageData.call(offCtx, 0, 0, 1, 1);
+                                if (pixel && pixel.data && pixel.data.length >= 4) {
+                                    pixel.data[0] = (pixel.data[0] + NOISE_OFFSET) % 256;
+                                    offCtx.putImageData(pixel, 0, 0);
+                                }
+                                return origToBlob.call(offscreen, callback, type, quality);
+                            }
                         }
                     } catch (e) {}
                     return origToBlob.call(this, callback, type, quality);
-                };
+                }, 'toBlob');
             } catch (e) {}
         """.trimIndent()
 
         return """
         (() => {
             'use strict';
+
+            // 0. Native Function Cloaking ([native code])
+            const nativeMap = new WeakMap();
+            const origToString = Function.prototype.toString;
+            Function.prototype.toString = function() {
+                if (nativeMap.has(this)) {
+                    return 'function ' + nativeMap.get(this) + '() { [native code] }';
+                }
+                return origToString.call(this);
+            };
+            const cloak = (fn, name) => {
+                try {
+                    nativeMap.set(fn, name);
+                } catch (e) {}
+                return fn;
+            };
 
             // 1. WebRTC Kill-switch: eliminate STUN/ICE local & public IP discovery
             const killProperty = (target, prop) => {
@@ -260,12 +294,15 @@ object AntiFingerprintHardener {
             $canvasNoiseJs
 
             // 8. Eliminate Russian TTS Voice Leak (window.speechSynthesis)
-            if (window.speechSynthesis) {
-                try {
-                    window.speechSynthesis.getVoices = () => [];
+            try {
+                if (window.speechSynthesis) {
+                    window.speechSynthesis.getVoices = cloak(() => [], 'getVoices');
                     window.speechSynthesis.onvoiceschanged = null;
-                } catch (e) {}
-            }
+                }
+                if (window.SpeechSynthesis && SpeechSynthesis.prototype) {
+                    SpeechSynthesis.prototype.getVoices = cloak(() => [], 'getVoices');
+                }
+            } catch (e) {}
 
             // 9. Lock All Intl Constructors resolvedOptions to en-US
             try {

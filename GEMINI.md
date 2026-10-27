@@ -7,7 +7,7 @@
 ## 1. Общие Сведения о Проекте (Project Overview)
 
 - **Название приложения:** `ClaudeCage` (пакет: `com.example.claudecageand`).
-- **Текущая версия:** `1.0 (Build 1)` • **Hardening:** `Stage 9: Final Production Hardening`.
+- **Текущая версия:** `1.0 (Build 1)` • **Hardening:** `Stage 10: Zero-Trust Hardening & Code Review Remediation`.
 - **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36).
 - **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37).
 - **Целевой VPN-клиент:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray).
@@ -23,33 +23,60 @@
 1. **Запрет открытого трафика (Zero Cleartext):**
    - `android:usesCleartextTraffic="false"` в [`AndroidManifest.xml`](app/src/main/AndroidManifest.xml).
    - Прямой выход сокетов в сеть запрещён на уровне конфигурации.
-2. **Тотальная маршрутизация через локальный шлюз (100% SOCKS5 Proxy Override):**
+2. **Тотальная маршрутизация через локальный шлюз (100% SOCKS5 Proxy Override + Anti-Bypass):**
    - Весь трафик Chromium WebView принудительно направляется на внутренний SOCKS5 прокси (`127.0.0.1:<ephemeral_port>`) через `ProxyController.getInstance().setProxyOverride(...)`.
    - Режим `direct://` и любой сетевой fallback исключены (`isDirectFallbackDisallowed = true`).
-3. **Строгая привязка сокетов к VPN (Socket-Level Kernel Binding):**
-   - Каждый исходящий TCP-сокет (`VpnGatekeeperProxy` и `TunnelDnsResolver`) привязывается к сетевому стеку туннеля в строгом порядке:
-     1. `vpnNetwork?.bindSocket(socket)` — привязка непривязанного сокета к `NetID` сети VPN в ядре Android.
+   - Применяется `.removeImplicitRules()` в `ProxyConfig.Builder()`, предотвращающий автоматический обход прокси Chromium для `localhost` и `127.0.0.1`.
+   - Google Safe Browsing отключён через `WebSettingsCompat.setSafeBrowsingEnabled(settings, false)`, исключая сторонние внепрокси-запросы Chromium к серверам Google.
+3. **Белый список назначений и фильтр приватных IP (Destination Allowlist & Private IP Filter):**
+   - Доступ через SOCKS5 шлюз разрешён исключительно к доменам из белого списка `ALLOWED_DOMAIN_SUFFIXES` (`claude.ai`, `anthropic.com`, `intercom.io`, `statsig.com`, `browserleaks.com`, `google.com`, `gstatic.com`, `googleapis.com`, `appleid.apple.com`). Все сторонние домены мгновенно отклоняются `0x05 (Connection Refused)`.
+   - Прямые IPv4-подключения фильтруются через `isForbiddenIp`: запрещены loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), RFC 1918 приватные подсети (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) и IP самого tun-интерфейса.
+4. **Строгая привязка сокетов к VPN и поколенческий Kill-Switch (Generational Socket Binding):**
+   - Состояние `VpnTunnelState.Connected` строго хранит non-null `network: Network` и монотонный счётчик `generation: Long`.
+   - При подключении VPN вызывается `connectivityManager.bindProcessToNetwork(network)` (и `bindProcessToNetwork(null)` при отключении).
+   - Каждый исходящий TCP-сокет (`VpnGatekeeperProxy` и `TunnelDnsResolver`) привязывается в строгом порядке:
+     1. `network.bindSocket(socket)` — обязательный системный вызов ядра. При любой ошибке соединение немедленно прерывается (никакого silent fail-open).
      2. `socket.bind(InetSocketAddress(tunIpv4, 0))` — привязка локального IP источника к IPv4 адресу tun-адаптера.
-4. **Аппаратный Kill-Switch при потере VPN:**
-   - При переходе состояния VPN в `Disconnected` метод `VpnGatekeeperProxy.closeAllActiveSockets()` принудительно закрывает системные дескрипторы всех активных сокетов. Ни единого байта не может уйти через обычный Wi-Fi или сотовую сеть.
-5. **Fail-Closed TCP DNS с защитой от Doze Mode (Socket Watchdog):**
+   - Исходящие сокеты регистрируются с номером поколения: `outboundSockets: ConcurrentHashMap<Socket, Long>`.
+   - Синхронный слушатель `TunnelListener` вызывается под блокировкой `stateLock` при любом изменении VPN:
+     - При падении VPN мгновенно закрывает дескрипторы всех активных клиентских и серверных сокетов.
+     - При VPN handover (смене tun/NetID) мгновенно закрывает сокеты устаревших поколений (`gen < currentGeneration`).
+5. **Выделенный пул потоков для передачи трафика (Relay Anti-Starvation):**
+   - Двунаправленный пайпинг данных (`relayTraffic`) работает на выделенном пуле потоков `relayExecutor = Executors.newCachedThreadPool { ... }.asCoroutineDispatcher()`.
+   - Лимит пула `Dispatchers.IO` (64 потока) больше не расходуется на блокирующий ввод-вывод сокетов, что гарантирует мгновенное выполнение корутин таймеров, телеметрии и мониторинга.
+   - Реализовано полудуплексное закрытие TCP (`shutdownOutput()` / `shutdownInput()`).
+6. **Fail-Closed TCP DNS с выделенным Scheduled Watchdog, True SWR и Single-Flight:**
    - Системный DNS Android и сторонние Smart DNS полностью игнорируются.
    - Все запросы резолвятся внутри туннеля через TCP (`1.1.1.1:53` -> `8.8.8.8:53`).
-   - Для предотвращения 54-секундного зависания Linux ядра (`tcp_syn_retries`) при выходе устройства из сна используется сторожевой таймер `launch { delay(2500); socket.close() }`.
-   - Реализован **Stale-While-Revalidate DNS-кэш** (`staleCache`): если сеть временно не отвечает при включении экрана, отдаётся последний валидный IP домена для текущей VPN-сессии.
-6. **Региональный фильтр доменов (Regional Domain Guard):**
+   - Сторожевой таймер реализован через `watchdogExecutor: ScheduledExecutorService` (`newSingleThreadScheduledExecutor`), исключая влияние загрузки корутинного пула потоков.
+   - **Single-Flight дедупликация:** `inFlightQueries: ConcurrentHashMap<String, Deferred<Inet4Address?>>` объединяет параллельные запросы к одному домену в один сетевой запрос.
+   - **True Stale-While-Revalidate (SWR):** при истечении TTL кэша сразу отдаётся stale-запись из памяти, а в фоне запускается асинхронное обновление через туннель (`dnsScope.launch { executeNetworkResolve(...) }`).
+   - Stale-кэш сохраняется при переподключениях VPN (`clearCache(clearStale = false)`).
+   - Валидация QNAME в DNS-ответе и рандомизация выбора адреса при множественных A-записях.
+7. **Региональный фильтр доменов (Regional Domain Guard):**
+   - Нормализация доменов перед проверкой: `.trim().trimEnd('.').lowercase(Locale.ROOT)`.
    - Запросы к `.google.ru` прозрачно переписываются на `.google.com`.
    - Домены СНГ (`.ru`, `.su`, `.by`, `.xn--p1ai`) немедленно блокируются ответом `REP_CONN_REFUSED` (`0x05`).
    - IPv6 (`ATYP 0x04`) отклоняется ответом `REP_ADDR_TYPE_NOT_SUPPORTED` (`0x08`).
-7. **Многопрофильная контейнеризация аккаунтов (Multi-Account Isolation):**
+8. **Многопрофильная контейнеризация аккаунтов (Multi-Account Isolation & Keystore Security):**
    - Каждый аккаунт Claude имеет свой `profileSeed` и изолированное хранилище сессий.
    - При поддержке `WebViewFeature.MULTI_PROFILE` используется `ProfileStore` (`Profile.getOrCreate(...)`).
-   - При отсутствии `MULTI_PROFILE` используется шифрованный Cookie Jar с ключом в аппаратном `AndroidKeyStore` (`AES-256-GCM`) и программным fallback для тестов.
-8. **Глубокий спуфинг фингерпринта и окружения:**
+   - В `AccountCookieJarFallback` генерация IV доверена провайдеру `AndroidKeyStore` (`cipher.init(Cipher.ENCRYPT_MODE, key)` без явного IV, с последующим получением `cipher.iv`), что устраняет `InvalidAlgorithmParameterException: Caller-provided IV not permitted`.
+   - Аутентифицированные данные GCM AAD привязаны к идентификатору профиля (`cipher.updateAAD(profileId.toByteArray())`) для защиты от подмены шифротекста между профилями.
+   - Парсинг JSON профилей переведён на надёжный `org.json.JSONArray` / `JSONObject` вместо хрупких регулярных выражений.
+   - Удаление активного профиля защищено предварительным переключением на оставшийся профиль.
+9. **Глубокий спуфинг фингерпринта и окружения (Document-Start JS & DOM Protection):**
    - POSIX: `setenv("TZ", "Europe/Amsterdam", 1)` + `tzset()`.
    - JVM: `TimeZone.setDefault("Europe/Amsterdam")`, `Locale.setDefault(Locale.US)`.
-   - Android OS: `LocaleList.setDefault(LocaleList(Locale.US))` (на API 24+) для предотвращения утечки `Accept-Language: ru-RU` в субресурсах.
-   - Document-Start JS: WebRTC полностью отключён (`RTCPeerConnection = null`), детерминированный шум Canvas (`safeSeed >= 1`) для `getImageData`, `toDataURL` и `toBlob`, блокировка русских TTS-голосов (`speechSynthesis.getVoices = () => []`), фиксация `Intl.*` на `en-US`, `navigator.webdriver = false`, `navigator.connection.onchange = null`.
+   - Android OS: `LocaleList.setDefault(LocaleList(Locale.US))` (на API 24+).
+   - Document-Start JS: WebRTC полностью ампутирован (`RTCPeerConnection = null`).
+   - **Offscreen Canvas Farbling:** при вызовах `toDataURL` и `toBlob` для наложения детерминированного шума создаётся временный оффскрин-холст (`document.createElement('canvas')`), предотвращая перманентное разрушение исходного холста страницы и визуальные артефакты.
+   - **`Function.prototype.toString` Cloaking:** использование `WeakMap` маскирует переопределённые JS-методы под нативные (`function name() { [native code] }`).
+   - Блокировка TTS-голосов на уровне `window.speechSynthesis` и `SpeechSynthesis.prototype.getVoices`.
+   - Фиксация `Intl.*` на `en-US`, `hardwareConcurrency = 8`, `deviceMemory = 8`, `navigator.webdriver = false`, `navigator.connection.onchange = null`.
+10. **Отказоустойчивость WebView и валидация Origin:**
+    - Реализован `onRenderProcessGone` в `WebViewClient`: при сбое или нехватке памяти рендерера Chromium Activity не падает, а безопасно пересоздаёт WebView.
+    - В `SafeDownloadBridge` встроена строгая валидация источника (`url.startsWith("https://claude.ai")`), предотвращающая междоменный вызов загрузчика.
 
 ---
 
@@ -58,18 +85,19 @@
 ```text
 app/src/main/java/com/example/claudecageand/
 ├── ClaudeCageApp.kt                      # Application класс: синглтоны, POSIX TZ, JVM Locale, LocaleList.setDefault
-├── MainActivity.kt                       # Главная Activity: WebView, профили, плавающий якорь, Card UI, версии, SafeDownload
+├── MainActivity.kt                       # Главная Activity: WebView, профили, плавающий якорь, Card UI, версии, SafeDownload, onRenderProcessGone
 ├── accounts/
 │   ├── AccountProfile.kt                 # Модель данных профиля: id, displayName, storageKey, profileSeed, createdAt
 │   ├── AccountProfileManager.kt          # Менеджер профилей: переключение, добавление, удаление, StateFlow
-│   └── AccountCookieJarFallback.kt       # Резервный CookieJar: AES-256-GCM шифрование через AndroidKeyStore (с JVM fallback)
+│   ├── AccountProfileJsonCodec.kt        # JSON сериализация профилей на org.json (JSONArray / JSONObject)
+│   └── AccountCookieJarFallback.kt       # Резервный CookieJar: AES-256-GCM (AndroidKeyStore auto-IV, AAD привязка к profileId)
 ├── net/
-│   ├── TunnelDnsResolver.kt              # TCP DNS (1.1.1.1/8.8.8.8): Watchdog 2.5с, StaleCache, TTL 300с, RFC 1035
-│   ├── VpnGatekeeperProxy.kt             # SOCKS5 шлюз: привязка к tun, Regional Guard (.ru/.by блок), socket killer
-│   ├── VpnStateMonitor.kt                # Мониторинг VPN: ConnectivityManager NetworkCallback, StateFlow<VpnTunnelState>
-│   └── VpnTunnelState.kt                 # Sealed class состояний: Connected (tunIpv4, network, iface) vs Disconnected
+│   ├── TunnelDnsResolver.kt              # TCP DNS: ScheduledExecutor watchdog, True SWR, Single-Flight, RFC 1035
+│   ├── VpnGatekeeperProxy.kt             # SOCKS5 шлюз: Allowlist доменов, private IP filter, relay thread pool, generational sockets
+│   ├── VpnStateMonitor.kt                # Мониторинг VPN: non-null Network, generation counter, bindProcessToNetwork, TunnelListener
+│   └── VpnTunnelState.kt                 # Sealed class состояний: Connected (tunIpv4, network, iface, generation) vs Disconnected
 ├── security/
-│   └── AntiFingerprintHardener.kt        # Document-Start JS: WebRTC Kill-Switch, Canvas noise, TTS voice block, Intl lock
+│   └── AntiFingerprintHardener.kt        # Document-Start JS: WebRTC Kill-Switch, offscreen Canvas farbling, toString cloaking, TTS/Intl lock
 ├── telemetry/
 │   └── SecurityAuditLogger.kt            # Логгер безопасности, кольцевой буфер (500 записей), генератор отчётов Markdown
 └── ui/
@@ -86,62 +114,68 @@ app/src/main/java/com/example/claudecageand/
 ### 4.1. Сетевой Шлюз `VpnGatekeeperProxy.kt`
 - **Протокол:** RFC 1928 SOCKS5 на `127.0.0.1:<random-port>`.
 - **Поддерживаемые команды:** `CMD_CONNECT (0x01)`.
+- **Политика назначения (Zero-Trust Allowlist):**
+  - Разрешены только домены экосистемы Claude/Anthropic: `claude.ai`, `anthropic.com`, `intercom.io`, `statsig.com`, `browserleaks.com`, `google.com`, `gstatic.com`, `googleapis.com`, `appleid.apple.com`. Любые иные домены отвергаются `0x05 (Connection refused)`.
+  - Фильтр IP-адресов `isForbiddenIp`: запрещает loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), RFC 1918 приватные диапазоны (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) и собственный IP tun-адаптера.
 - **Адресные типы:**
-  - `ATYP_IPV4 (0x01)`: проверка валидности, исключение loopback/multicast.
+  - `ATYP_IPV4 (0x01)`: проверка `isForbiddenIp`, исключение непубличных IP.
   - `ATYP_DOMAIN (0x03)`:
+    - Нормализация: `.trim().trimEnd('.').lowercase(Locale.ROOT)`.
     - `.google.ru` $\to$ прозрачный rewrite в `.google.com`.
-    - Домены `.ru`, `.su`, `.by`, `.xn--p1ai` $\to$ моментальный отказ `0x05 (Connection refused)`.
+    - Домены СНГ (`.ru`, `.su`, `.by`, `.xn--p1ai`) и домены вне белого списка $\to$ моментальный отказ `0x05`.
     - Локальный резолвинг через `TunnelDnsResolver.resolve(domain)`.
   - `ATYP_IPV6 (0x04)`: немедленный отказ `0x08 (Address type not supported)`.
-- **Сокет-трекинг:** `activeSockets: Set<Socket>` регистрирует каждый сокет клиента и удалённого сервера. Метод `closeAllActiveSockets()` вызывается при смене VPN-состояния.
+- **Выделенный пул ретрансляции (`relayExecutor`):**
+  - Двунаправленный обмен сокетов обслуживается `Executors.newCachedThreadPool()`, предотвращая голодание `Dispatchers.IO` (лимит 64 потока) при параллельных запросах.
+  - Симметричный half-duplex shutdown (`shutdownOutput()` / `shutdownInput()`) при завершении одного из направлений.
+- **Поколенческий сокет-трекинг:** `outboundSockets: ConcurrentHashMap<Socket, Long>` регистрирует исходящие сокеты с номером поколения туннеля. При разрыве VPN или смене туннеля (handover) синхронный коллбэк `TunnelListener` закрывает дескрипторы устаревших сокетов.
 
 ### 4.2. Резолвер DNS `TunnelDnsResolver.kt`
 - **Протокол:** RFC 1035 TCP DNS (2-байтный префикс длины сообщения).
 - **Серверы:** Primary `1.1.1.1:53`, Fallback `8.8.8.8:53`.
-- **Watchdog:** `val watchdog = launch { delay(2500); socket.close() }` прерывает блокирующие системные вызовы ядра. `DNS_TIMEOUT_MS = 2500`.
-- **Алгоритм резолвинга (`resolve`):**
-  1. Проверка `cache[cleanDomain]` (положительный TTL: 300 секунд).
-  2. Проверка `negativeCache[cleanDomain]` (отрицательный TTL: 60 секунд, для canaries/NODATA).
-  3. Сетевой запрос к Primary (1.1.1.1:53).
-  4. При ошибке/таймауте — запрос к Fallback (8.8.8.8:53).
-  5. При повторной ошибке (Doze Mode wake-up) — пауза 150 мс и повтор к 1.1.1.1.
-  6. Если все сетевые попытки исчерпаны — проверка `staleCache[cleanDomain]`. Если запись есть, она возвращается с логированием `Wake-up fallback: serving last-known IP`.
-  7. При успехе результат кэшируется в `cache` и `staleCache`.
-  8. При разрыве VPN вызов `clearCache()` полностью очищает `cache` и `staleCache`.
+- **Scheduled Watchdog:** `watchdogExecutor: ScheduledExecutorService` (`newSingleThreadScheduledExecutor`) принудительно закрывает системный сокет ровно через `DNS_TIMEOUT_MS = 2500` мс, не завися от корутинного пула потоков.
+- **Single-Flight Дедупликация:** `inFlightQueries: ConcurrentHashMap<String, Deferred<Inet4Address?>>` объединяет одновременные запросы к одному домену в один сетевой запрос, устраняя шквал повторных обращений к DNS.
+- **True Stale-While-Revalidate (SWR):**
+  - Если запись есть в кэше и TTL не истёк — отдаётся немедленно.
+  - Если запись устарела по TTL, но присутствует в `staleCache`, она отдаётся сразу, а обновление запускается в фоне: `dnsScope.launch { executeNetworkResolve(...) }`.
+  - Stale-кэш сохраняется при кратковременных падениях VPN (`clearCache(clearStale = false)`).
+- **Валидация ответов:** сверка QNAME в секции Query ответа с запрошенным доменом, защита от спуфинга Transaction ID через `SecureRandom`, рандомизация адреса при возврате нескольких A-записей.
 
 ### 4.3. Харденинг Веб-Движка `AntiFingerprintHardener.kt`
 - Инжектируется через `WebViewCompat.addDocumentStartJavaScript(...)`.
-- **WebRTC:** Переопределены в `null` и удалены: `RTCPeerConnection`, `webkitRTCPeerConnection`, `RTCDataChannel`, `RTCSessionDescription`, `navigator.mediaDevices.getUserMedia`.
-- **Canvas шум:**
-  ```javascript
-  const safeSeed = (Math.abs(profileSeed) % 997) + 1; // Гарантированно >= 1
-  ```
-  Модифицирует первый пиксель на детерминированное смещение в `getImageData`, `toDataURL` и `HTMLCanvasElement.prototype.toBlob`.
-- **TTS-голоса:** `speechSynthesis.getVoices = () => []` блокирует детекцию русских системных голосовых пакетов.
-- **Intl:** `NumberFormat`, `Collator`, `PluralRules`, `RelativeTimeFormat` возвращают `locale = 'en-US'`.
-- **Аппаратные характеристики:** `hardwareConcurrency = 8`, `deviceMemory = 8`.
-- **Webdriver и сеть:** `navigator.webdriver = false`, `navigator.connection.onchange = null`.
+- **WebRTC:** Полная ампутация: `RTCPeerConnection`, `webkitRTCPeerConnection`, `RTCDataChannel`, `RTCSessionDescription`, `navigator.mediaDevices.getUserMedia` обращены в `null` и удалены.
+- **Offscreen Canvas Farbling:**
+  - Детерминированный шум на базе `profileSeed`: `val safeSeed = (kotlin.math.abs(profileSeed) % 997) + 1`.
+  - При вызовах `toDataURL` и `toBlob` шум накладывается на **временный оффскрин-холст** (`document.createElement('canvas')`), предотвращая порчу пикселей на оригинальном холсте страницы и исключая детекцию антифрод-системами.
+- **Маскировка функций (`Function.prototype.toString` Cloaking):**
+  - Подмененные функции регистрируются в `WeakMap`.
+  - `Function.prototype.toString` возвращает `function name() { [native code] }` для всех перехваченных методов, маскируя внедрение скрипта.
+- **TTS-голоса:** `window.speechSynthesis.getVoices = () => []` и `SpeechSynthesis.prototype.getVoices = () => []` блокируют определение русских системных голосовых пакетов.
+- **Intl & Окружение:** `Intl.*` зафиксирован на `en-US`, `hardwareConcurrency = 8`, `deviceMemory = 8`, `navigator.webdriver = false`, `navigator.connection.onchange = null`.
 
 ### 4.4. Менеджер Аккаунтов и Cookie `AccountProfileManager.kt`
-- **Профили:** Хранятся в JSON в приватных SharedPreferences (`claudecage_account_profiles`).
+- **Профили:** Хранятся в JSON в приватных SharedPreferences (`claudecage_account_profiles`), сериализуются через `AccountProfileJsonCodec` на базе `org.json`.
 - **Изоляция:**
   - Modern (API 29+ & WebKit feature): `ProfileStore.getInstance().getOrCreateProfile(storageKey)`.
   - Fallback: `AccountCookieJarFallback` перехватывает cookie активного профиля перед сменой, очищает `CookieManager`, восстанавливает cookie нового профиля.
-- **Шифрование Cookie:** AES-256-GCM с 12-байтным IV. Мастер-ключ создаётся в аппаратном модуле `AndroidKeyStore` (`claudecage_cookie_aes_key`). При запуске на хост-JVM (без AndroidKeyStore) автоматически переключается на программный AES генератор.
-- **Смена профиля в UI:** `switchAccountProfile()` обязательно устанавливает `hasLoadedInitialUrl = false` перед `initWebView(targetProfile)`, устраняя проблему белого экрана.
+- **Шифрование Cookie (AES-256-GCM):**
+  - Генерация IV доверена аппаратной реализации `AndroidKeyStore` (`cipher.init(Cipher.ENCRYPT_MODE, secretKey)` без явного IV, IV считывается из `cipher.iv`), что исключает `InvalidAlgorithmParameterException`.
+  - Дополнительные аутентифицированные данные GCM AAD привязаны к `profileId` (`cipher.updateAAD(profileId.toByteArray())`) для защиты от перестановки зашифрованных cookie между профилями.
+- **Безопасное переключение и удаление:** перед удалением активного профиля менеджер переключается на альтернативный профиль, предотвращая гонки и белый экран.
 
 ### 4.5. Интерфейс и Activity `MainActivity.kt`
-- **Сворачиваемый статус-бар:**
-  - 🟢 **Зелёный (Protected):** VPN активен, туннель исправен.
-  - 🟡 **Жёлтый (Amber Dead-Tunnel):** VPN подключён, но `consecutiveNetworkTimeouts >= 2` (таймауты DNS).
-  - 🔴 **Красный (Blocked):** VPN отключён, Kill-Switch изолирует сеть.
-- **Плавающий якорь безопасности (`viewFloatingSecurityAnchor`):** Минималистичный перемещаемый бейдж с точкой-индикатором и названием активного аккаунта. Сохраняет координаты в `SharedPreferences`.
-- **Карточный UI (`createCardBackground`):** Все списки, секции диагностики и метрики обёрнуты в закруглённые карточки (`#161B22` / `#1E222B`).
-- **Просмотр версий (`ComponentVersions`):**
-  - Секция 0 в панели диагностики: отображает версии приложения, WebKit Chromium, Android OS, ABI устройства и стадию харденинга.
-  - Кнопка «📦 Версии компонентов» открывает модальное окно с детальным отчётом и возможностью копирования в буфер обмена.
-- **Безопасная загрузка (`SafeDownloadBridge`):** Скачивание файлов и артефактов Claude через JS bridge `"ClaudeCageDownload"` (fetch $\to$ blob $\to$ Base64 $\to$ Storage Access Framework `createDocumentLauncher`).
-- **Защита Recents (`FLAG_SECURE`):** Предотвращает снятие скриншотов и превью в списке недавних приложений. Включена по умолчанию с возможностью переключения в диалоге диагностики.
+- **Anti-Bypass и отключение SafeBrowsing:**
+  - `ProxyConfig.Builder().removeImplicitRules()` гарантирует, что WebView не обходит внутренний SOCKS5 прокси для обращений к `localhost` и `127.0.0.1`.
+  - `WebSettingsCompat.setSafeBrowsingEnabled(settings, false)` отключает внепроксийные запросы Chromium к облачной телеметрии Google Safe Browsing.
+- **Устойчивость к падениям рендерера (`onRenderProcessGone`):**
+  - При нехватке памяти или сбое Chromium рендерер перезапускается без падения Activity, возвращая `true`.
+- **Безопасная загрузка (`SafeDownloadBridge`):**
+  - JS-мост `"ClaudeCageDownload"` проверяет происхождение: `wv.url?.startsWith("https://claude.ai") == true`, блокируя загрузки из недоверенных фреймов.
+- **Сворачиваемый статус-бар и плавающий якорь:**
+  - Индикация состояний: 🟢 Protected, 🟡 Amber (таймауты туннеля $\ge 2$), 🔴 Blocked (Kill-Switch).
+  - Перемещаемый бейдж безопасности с сохранением координат.
+- **Карточный UI и просмотр версий компонентов (`ComponentVersions`).**
+- **Защита Recents (`FLAG_SECURE`):** предотвращение скриншотов и превью в диспетчере задач.
 
 ---
 
@@ -195,6 +229,7 @@ app/src/main/java/com/example/claudecageand/
 
 1. **Никакого хардкода строк в UI:** Все строки интерфейса должны объявляться в [`UiStrings.kt`](app/src/main/java/com/example/claudecageand/ui/UiStrings.kt) сразу на двух языках (RU и EN). После добавления новых методов обязательно добавлять проверки в [`UiStringsAndLanguageTest.kt`](app/src/test/java/com/example/claudecageand/ui/UiStringsAndLanguageTest.kt).
 2. **Никаких блокирующих вызовов в основном потоке:** Сетевые операции, шифрование и работа с сокетами проводятся только в диспетчере `Dispatchers.IO` или фоновых потоках.
-3. **Блокирующие системные вызовы сокетов:** Никогда не полагаться только на `withTimeoutOrNull` для прерывания вызовов вроде `Socket.connect()` или `InputStream.read()`. Всегда использовать закрытие дескриптора через Socket Watchdog (`launch { delay(timeout); socket.close() }`).
-4. **Сохранение совместимости с JVM Unit Tests:** Классы, взаимодействующие с Android Keystore, ProfileStore или системными сервисами, обязаны иметь безопасный fallback/mock для прохождения тестов `./gradlew testDebugUnitTest` на хост-машине разработчика.
-5. **Не трогать dotfiles без инструкции:** В соответствии с пользовательскими правилами, любые изменения в dotfiles требуют предварительного создания ветки в git bare репозитории и бэкапа в `~/.config-backups/`.
+3. **Блокирующие системные вызовы сокетов и пулы потоков:** Никогда не полагаться только на `withTimeoutOrNull` для прерывания вызовов вроде `Socket.connect()` или `InputStream.read()`. Для DNS-запросов обязательно использовать выделенный `ScheduledExecutorService` watchdog, не зависящий от корутинного пула. Длительный двунаправленный ретрансляционный I/O сокетов (`pipe`) выносить исключительно в отдельный пул потоков (`relayExecutor`), не занимая ограниченный `Dispatchers.IO` (лимит 64 потока).
+4. **Безопасность криптографии AndroidKeyStore:** При шифровании AES-GCM не передавать собственный IV в `cipher.init(Cipher.ENCRYPT_MODE, key)`. Доверять генерацию случайного IV аппаратному провайдеру Keystore, считывать сгенерированный IV через `cipher.iv` и сохранять его с префиксом к шифротексту. Всегда связывать AAD с контекстом сущности (например, `profileId`).
+5. **Сохранение совместимости с JVM Unit Tests:** Классы, взаимодействующие с Android Keystore, ProfileStore или системными сервисами, обязаны иметь безопасный fallback/mock для прохождения тестов `./gradlew testDebugUnitTest` на хост-машине разработчика.
+6. **Не трогать dotfiles без инструкции:** В соответствии с пользовательскими правилами, любые изменения в dotfiles требуют предварительного создания ветки в git bare репозитории и бэкапа в `~/.config-backups/`.
