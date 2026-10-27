@@ -4,7 +4,7 @@
 **Целевая аудитория аудита:** Gemini Argon 4 (Frontier Reasoning & Security Architecture Model)  
 **Дата актуализации:** 27 октября 2026 г.  
 **Проект:** `ClaudeCage` (пакет: `com.example.claudecageand`)  
-**Текущая версия:** `1.2 (Build 3)` • **Уровень харденинга:** `Stage 10.2: Zero-Trust Hardening & Production Hotfix (JavaBridge Threading, Smart WakeLock, Fallback Cookie Purge)`  
+**Текущая версия:** `1.3 (Build 4)` • **Уровень харденинга:** `Stage 10.2: Zero-Trust Hardening & Production Hotfix (JavaBridge Threading, Smart WakeLock, Fallback Cookie Purge)`  
 **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36)  
 **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37)  
 **Целевой сетевой туннель:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray)  
@@ -3717,7 +3717,7 @@ class MainActivity : AppCompatActivity() {
         return ComponentVersions(
             appVersionName = verName,
             appVersionCode = verCode,
-            stageHardening = "Stage 10.1: Zero-Trust Hardening & Production Hotfix",
+            stageHardening = "Stage 10.2: Zero-Trust Hardening & Production Hotfix",
             androidRelease = Build.VERSION.RELEASE,
             apiLevel = Build.VERSION.SDK_INT,
             securityPatch = patch,
@@ -5023,7 +5023,7 @@ class SecurityAuditLogger(context: Context) {
         sb.appendLine()
 
         sb.appendLine("## 1. Device & OS Environment")
-        sb.appendLine("- **App & Hardening:** `ClaudeCage v1.2 (Build 3) • Stage 10.1: Zero-Trust Hardening & Production Hotfix`")
+        sb.appendLine("- **App & Hardening:** `ClaudeCage v1.3 (Build 4) • Stage 10.2: Zero-Trust Hardening & Production Hotfix`")
         sb.appendLine("- **Device:** `${Build.MANUFACTURER} ${Build.MODEL} (${Build.DEVICE})`")
         sb.appendLine("- **Android Version:** `Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})`")
         sb.appendLine("- **Target SDK:** `API 36`, **Min SDK:** `API 33`")
@@ -5587,7 +5587,7 @@ data class AccountProfile(
 ```
 
 ### 5.13. `app/build.gradle.kts`
-**Назначение и роль в безопасности:** Конфигурация сборки Gradle: зависимости, SDK targets (Min 33, Target 36), скрипт копирования APK ClaudeCage-1.2.apk
+**Назначение и роль в безопасности:** Конфигурация сборки Gradle: зависимости, SDK targets (Min 33, Target 36), скрипт копирования APK ClaudeCage-1.3.apk
 
 ```kotlin
 plugins {
@@ -5606,8 +5606,8 @@ android {
         applicationId = "com.example.claudecageand"
         minSdk = 33
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 4
+        versionName = "1.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -5634,7 +5634,7 @@ tasks.register("copyApkToRoot") {
         val debugApkDir = File(buildDir, "outputs/apk/debug")
         val apkFile = debugApkDir.listFiles()?.firstOrNull { it.extension == "apk" && !it.name.contains("unaligned") }
         if (apkFile != null) {
-            val ver = android.defaultConfig.versionName ?: "1.2"
+            val ver = android.defaultConfig.versionName ?: "1.3"
             val targetName = "ClaudeCage-$ver.apk"
             val destInRoot = File(rootDir, targetName)
 
@@ -5760,7 +5760,7 @@ dependencies {
 ## 1. Общие Сведения о Проекте (Project Overview)
 
 - **Название приложения:** `ClaudeCage` (пакет: `com.example.claudecageand`).
-- **Текущая версия:** `1.2 (Build 3)` • **Hardening:** `Stage 10.2: Zero-Trust Hardening & Production Hotfix (JavaBridge Threading, Smart WakeLock, Fallback Cookie Purge)`.
+- **Текущая версия:** `1.3 (Build 4)` • **Hardening:** `Stage 10.2: Zero-Trust Hardening & Production Hotfix (JavaBridge Threading, Smart WakeLock, Fallback Cookie Purge)`.
 - **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36).
 - **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37).
 - **Целевой VPN-клиент:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray).
@@ -6029,7 +6029,7 @@ app/src/main/java/com/example/claudecageand/
      - `UiStringsAndLanguageTest`, `AccountProfileManagerTest`, `SecurityAuditLoggerTest`, `AppIconManagerTest`, `VpnTunnelStateTest`.
 2. **Сборка Production APK (`./gradlew assembleDebug`):**
    - **Результат:** `BUILD SUCCESSFUL`
-   - **Собранный файл:** `ClaudeCage-1.2.apk` в корне проекта (`12 938 319 байт`). Устаревшие бинарники автоматически удалены скриптом сборки.
+   - **Собранный файл:** `ClaudeCage-1.3.apk` в корне проекта. Устаревшие бинарники автоматически удалены скриптом сборки.
 
 ---
 

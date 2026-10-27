@@ -247,7 +247,7 @@ class SecurityAuditLogger(context: Context) {
         sb.appendLine()
 
         sb.appendLine("## 1. Device & OS Environment")
-        sb.appendLine("- **App & Hardening:** `ClaudeCage v1.2 (Build 3) • Stage 10.1: Zero-Trust Hardening & Production Hotfix`")
+        sb.appendLine("- **App & Hardening:** `ClaudeCage v1.3 (Build 4) • Stage 10.2: Zero-Trust Hardening & Production Hotfix`")
         sb.appendLine("- **Device:** `${Build.MANUFACTURER} ${Build.MODEL} (${Build.DEVICE})`")
         sb.appendLine("- **Android Version:** `Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})`")
         sb.appendLine("- **Target SDK:** `API 36`, **Min SDK:** `API 33`")

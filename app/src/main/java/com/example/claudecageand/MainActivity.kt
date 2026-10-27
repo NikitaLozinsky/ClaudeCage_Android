@@ -1740,7 +1740,7 @@ class MainActivity : AppCompatActivity() {
         return ComponentVersions(
             appVersionName = verName,
             appVersionCode = verCode,
-            stageHardening = "Stage 10.1: Zero-Trust Hardening & Production Hotfix",
+            stageHardening = "Stage 10.2: Zero-Trust Hardening & Production Hotfix",
             androidRelease = Build.VERSION.RELEASE,
             apiLevel = Build.VERSION.SDK_INT,
             securityPatch = patch,

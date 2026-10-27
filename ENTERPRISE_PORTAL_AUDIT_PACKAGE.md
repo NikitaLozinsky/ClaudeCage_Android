@@ -153,8 +153,8 @@ android {
         applicationId = "com.corp.enclaveshield"
         minSdk = 33
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 4
+        versionName = "1.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -181,7 +181,7 @@ tasks.register("copyApkToRoot") {
         val debugApkDir = File(buildDir, "outputs/apk/debug")
         val apkFile = debugApkDir.listFiles()?.firstOrNull { it.extension == "apk" && !it.name.contains("unaligned") }
         if (apkFile != null) {
-            val ver = android.defaultConfig.versionName ?: "1.2"
+            val ver = android.defaultConfig.versionName ?: "1.3"
             val targetName = "EnclaveShield-$ver.apk"
             val destInRoot = File(rootDir, targetName)
 
@@ -2115,7 +2115,7 @@ class MainActivity : AppCompatActivity() {
         return ComponentVersions(
             appVersionName = verName,
             appVersionCode = verCode,
-            stageHardening = "Stage 10.1: Zero-Trust Hardening & Production Hotfix",
+            stageHardening = "Stage 10.2: Zero-Trust Hardening & Production Hotfix",
             androidRelease = Build.VERSION.RELEASE,
             apiLevel = Build.VERSION.SDK_INT,
             securityPatch = patch,
@@ -5493,7 +5493,7 @@ class SecurityAuditLogger(context: Context) {
         sb.appendLine()
 
         sb.appendLine("## 1. Device & OS Environment")
-        sb.appendLine("- **App & Hardening:** `EnclaveShield v1.2 (Build 3) • Stage 10.1: Zero-Trust Hardening & Production Hotfix`")
+        sb.appendLine("- **App & Hardening:** `EnclaveShield v1.3 (Build 4) • Stage 10.2: Zero-Trust Hardening & Production Hotfix`")
         sb.appendLine("- **Device:** `${Build.MANUFACTURER} ${Build.MODEL} (${Build.DEVICE})`")
         sb.appendLine("- **Android Version:** `Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})`")
         sb.appendLine("- **Target SDK:** `API 36`, **Min SDK:** `API 33`")
