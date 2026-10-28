@@ -12,11 +12,15 @@ import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Base64
 import android.util.Log
+import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -87,12 +91,19 @@ import java.util.concurrent.ConcurrentHashMap
  * 6. File and image uploads in Claude chat are supported via [WebChromeClient.onShowFileChooser].
  * 7. Bilingual UI (RU/EN) is maintained entirely in Kotlin memory without modifying JVM Locale.
  */
+enum class FloatingAnchorShape(val id: Int) {
+    PILL(0),
+    SQUARE(1),
+    CIRCLE(2)
+}
+
 class MainActivity : AppCompatActivity() {
 
     private val app: ClaudeCageApp
         get() = ClaudeCageApp.instance
 
     private lateinit var vpnStatusBar: View
+    private lateinit var layoutStatusText: View
     private lateinit var tvVpnStatus: TextView
     private lateinit var tvVpnSubStatus: TextView
     private lateinit var btnDiagnostics: TextView
@@ -100,9 +111,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnAccountSwitcher: TextView
     private lateinit var btnLangToggle: TextView
     private lateinit var btnReload: TextView
+    private lateinit var btnBarSizeToggle: TextView
     private lateinit var btnCollapseBar: TextView
     private lateinit var floatingSecurityAnchor: View
     private lateinit var viewAnchorDot: View
+    private lateinit var tvAnchorMiniBadge: TextView
     private lateinit var tvFloatingAnchorStatus: TextView
     private lateinit var tvFloatingAnchorAccount: TextView
     private lateinit var webViewContainer: FrameLayout
@@ -114,6 +127,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvSecurityErrorDesc: TextView
 
     private var isTopBarCollapsed: Boolean = false
+    private var isTopBarMinimal: Boolean = false
+    private var currentAnchorShape: FloatingAnchorShape = FloatingAnchorShape.PILL
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var pendingSingleTapRunnable: Runnable? = null
+    private var lastAnchorTapTime: Long = 0L
     private var backgroundWakeLock: PowerManager.WakeLock? = null
 
     @Volatile
@@ -271,6 +289,13 @@ class MainActivity : AppCompatActivity() {
         isTopBarCollapsed = collapsePrefs.getBoolean(KEY_TOPBAR_COLLAPSED, false)
         setTopBarCollapsed(isTopBarCollapsed)
 
+        isTopBarMinimal = collapsePrefs.getBoolean(KEY_TOPBAR_MINIMAL, false)
+        setTopBarMinimal(isTopBarMinimal)
+
+        val savedShapeId = collapsePrefs.getInt(KEY_ANCHOR_SHAPE, FloatingAnchorShape.PILL.id)
+        val initialShape = FloatingAnchorShape.values().find { it.id == savedShapeId } ?: FloatingAnchorShape.PILL
+        applyAnchorShape(initialShape, animate = false)
+
         floatingSecurityAnchor.post {
             val savedX = collapsePrefs.getFloat(KEY_ANCHOR_X, -1f)
             val savedY = collapsePrefs.getFloat(KEY_ANCHOR_Y, -1f)
@@ -337,6 +362,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun bindViews() {
         vpnStatusBar = findViewById(R.id.vpnStatusBar)
+        layoutStatusText = findViewById(R.id.layoutStatusText)
         tvVpnStatus = findViewById(R.id.tvVpnStatus)
         tvVpnSubStatus = findViewById(R.id.tvVpnSubStatus)
         btnDiagnostics = findViewById(R.id.btnDiagnostics)
@@ -344,9 +370,11 @@ class MainActivity : AppCompatActivity() {
         btnAccountSwitcher = findViewById(R.id.btnAccountSwitcher)
         btnLangToggle = findViewById(R.id.btnLangToggle)
         btnReload = findViewById(R.id.btnReload)
+        btnBarSizeToggle = findViewById(R.id.btnBarSizeToggle)
         btnCollapseBar = findViewById(R.id.btnCollapseBar)
         floatingSecurityAnchor = findViewById(R.id.floatingSecurityAnchor)
         viewAnchorDot = findViewById(R.id.viewAnchorDot)
+        tvAnchorMiniBadge = findViewById(R.id.tvAnchorMiniBadge)
         tvFloatingAnchorStatus = findViewById(R.id.tvFloatingAnchorStatus)
         tvFloatingAnchorAccount = findViewById(R.id.tvFloatingAnchorAccount)
         webViewContainer = findViewById(R.id.webViewContainer)
@@ -367,6 +395,10 @@ class MainActivity : AppCompatActivity() {
             it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
             showDiagnosticsDialog()
             true
+        }
+        layoutStatusText.setOnClickListener {
+            it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+            showDiagnosticsDialog()
         }
         btnReturnToClaude.setOnClickListener {
             it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
@@ -389,6 +421,10 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, UiStrings.toastReloading(lang), Toast.LENGTH_SHORT).show()
             webView?.reload()
         }
+        btnBarSizeToggle.setOnClickListener {
+            it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+            setTopBarMinimal(!isTopBarMinimal)
+        }
         btnCollapseBar.setOnClickListener {
             it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
             setTopBarCollapsed(true)
@@ -409,6 +445,139 @@ class MainActivity : AppCompatActivity() {
         prefs.edit().putBoolean(KEY_TOPBAR_COLLAPSED, collapsed).apply()
     }
 
+    private fun setTopBarMinimal(minimal: Boolean) {
+        isTopBarMinimal = minimal
+        val density = resources.displayMetrics.density
+
+        if (minimal) {
+            vpnStatusBar.minimumHeight = (26 * density).toInt()
+            vpnStatusBar.setPadding(
+                (8 * density).toInt(),
+                (2 * density).toInt(),
+                (8 * density).toInt(),
+                (2 * density).toInt()
+            )
+            tvVpnSubStatus.visibility = View.GONE
+            tvVpnStatus.textSize = 11f
+            btnDiagnostics.visibility = View.GONE
+            btnAccountSwitcher.visibility = View.GONE
+            btnLangToggle.visibility = View.GONE
+            btnBarSizeToggle.text = "⤢"
+        } else {
+            vpnStatusBar.minimumHeight = (42 * density).toInt()
+            vpnStatusBar.setPadding(
+                (10 * density).toInt(),
+                (4 * density).toInt(),
+                (10 * density).toInt(),
+                (4 * density).toInt()
+            )
+            tvVpnSubStatus.visibility = View.VISIBLE
+            tvVpnStatus.textSize = 12f
+            btnDiagnostics.visibility = View.VISIBLE
+            btnAccountSwitcher.visibility = View.VISIBLE
+            btnLangToggle.visibility = View.VISIBLE
+            btnBarSizeToggle.text = "⤡"
+        }
+
+        val currentTunnel = app.vpnStateMonitor.getCurrentTunnelState()
+        val proxyPort = app.vpnGatekeeperProxy.listeningPort
+        val lang = app.uiLanguageManager.language.value
+        refreshStatusBarText(currentTunnel, proxyPort, lang)
+
+        val prefs = getSharedPreferences(PREFS_UI_COLLAPSE, Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(KEY_TOPBAR_MINIMAL, minimal).apply()
+    }
+
+    private fun applyAnchorShape(shape: FloatingAnchorShape, animate: Boolean = true) {
+        currentAnchorShape = shape
+        val density = resources.displayMetrics.density
+
+        val bg = GradientDrawable().apply {
+            this.shape = GradientDrawable.RECTANGLE
+            cornerRadius = when (shape) {
+                FloatingAnchorShape.PILL -> 20f * density
+                FloatingAnchorShape.SQUARE -> 8f * density
+                FloatingAnchorShape.CIRCLE -> 24f * density
+            }
+            setColor(Color.parseColor("#E6161B22"))
+            setStroke((1 * density).toInt(), Color.parseColor("#38BDF8"))
+        }
+        floatingSecurityAnchor.background = bg
+
+        val dotParams = viewAnchorDot.layoutParams as LinearLayout.LayoutParams
+        val activeProfile = app.accountProfileManager.activeProfile.value
+        val initial = activeProfile.displayName.trim().take(1).uppercase(Locale.ROOT).ifBlank { "👤" }
+        tvAnchorMiniBadge.text = initial
+
+        when (shape) {
+            FloatingAnchorShape.PILL -> {
+                floatingSecurityAnchor.layoutParams = FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT
+                )
+                floatingSecurityAnchor.setPadding((10 * density).toInt(), (5 * density).toInt(), (10 * density).toInt(), (5 * density).toInt())
+                dotParams.width = (7 * density).toInt()
+                dotParams.height = (7 * density).toInt()
+                dotParams.marginEnd = (6 * density).toInt()
+                viewAnchorDot.layoutParams = dotParams
+
+                tvAnchorMiniBadge.visibility = View.GONE
+                tvFloatingAnchorStatus.visibility = View.VISIBLE
+                tvFloatingAnchorAccount.visibility = View.VISIBLE
+            }
+            FloatingAnchorShape.SQUARE -> {
+                val sizePx = (38 * density).toInt()
+                floatingSecurityAnchor.layoutParams = FrameLayout.LayoutParams(sizePx, sizePx)
+                floatingSecurityAnchor.setPadding(0, 0, 0, 0)
+                dotParams.width = (6 * density).toInt()
+                dotParams.height = (6 * density).toInt()
+                dotParams.marginEnd = (3 * density).toInt()
+                viewAnchorDot.layoutParams = dotParams
+
+                tvAnchorMiniBadge.visibility = View.VISIBLE
+                tvFloatingAnchorStatus.visibility = View.GONE
+                tvFloatingAnchorAccount.visibility = View.GONE
+            }
+            FloatingAnchorShape.CIRCLE -> {
+                val sizePx = (34 * density).toInt()
+                floatingSecurityAnchor.layoutParams = FrameLayout.LayoutParams(sizePx, sizePx)
+                floatingSecurityAnchor.setPadding(0, 0, 0, 0)
+                dotParams.width = (10 * density).toInt()
+                dotParams.height = (10 * density).toInt()
+                dotParams.marginEnd = 0
+                viewAnchorDot.layoutParams = dotParams
+
+                tvAnchorMiniBadge.visibility = View.GONE
+                tvFloatingAnchorStatus.visibility = View.GONE
+                tvFloatingAnchorAccount.visibility = View.GONE
+            }
+        }
+
+        val prefs = getSharedPreferences(PREFS_UI_COLLAPSE, Context.MODE_PRIVATE)
+        prefs.edit().putInt(KEY_ANCHOR_SHAPE, shape.id).apply()
+
+        floatingSecurityAnchor.post {
+            snapAnchorToNearestEdge(floatingSecurityAnchor)
+        }
+    }
+
+    private fun cycleAnchorShape() {
+        val next = when (currentAnchorShape) {
+            FloatingAnchorShape.PILL -> FloatingAnchorShape.SQUARE
+            FloatingAnchorShape.SQUARE -> FloatingAnchorShape.CIRCLE
+            FloatingAnchorShape.CIRCLE -> FloatingAnchorShape.PILL
+        }
+        floatingSecurityAnchor.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+        applyAnchorShape(next)
+        val lang = app.uiLanguageManager.language.value
+        val shapeName = when (next) {
+            FloatingAnchorShape.PILL -> UiStrings.shapePill(lang)
+            FloatingAnchorShape.SQUARE -> UiStrings.shapeSquare(lang)
+            FloatingAnchorShape.CIRCLE -> UiStrings.shapeCircle(lang)
+        }
+        Toast.makeText(this, UiStrings.toastAnchorShapeChanged(lang, shapeName), Toast.LENGTH_SHORT).show()
+    }
+
     @SuppressLint("ClickableViewAccessibility")
     private fun setupFloatingAnchorDragAndClick() {
         var dX = 0f
@@ -422,7 +591,63 @@ class MainActivity : AppCompatActivity() {
             showAccountDialog()
         }
 
+        val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            private var lastMorphTime = 0L
+
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                val now = System.currentTimeMillis()
+                if (now - lastMorphTime < 450L) return false
+
+                val factor = detector.scaleFactor
+                if (factor < 0.82f) { // Pinch in
+                    val nextShape = when (currentAnchorShape) {
+                        FloatingAnchorShape.PILL -> FloatingAnchorShape.SQUARE
+                        FloatingAnchorShape.SQUARE -> FloatingAnchorShape.CIRCLE
+                        FloatingAnchorShape.CIRCLE -> null
+                    }
+                    if (nextShape != null) {
+                        lastMorphTime = now
+                        floatingSecurityAnchor.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                        applyAnchorShape(nextShape)
+                        val lang = app.uiLanguageManager.language.value
+                        val shapeName = when (nextShape) {
+                            FloatingAnchorShape.PILL -> UiStrings.shapePill(lang)
+                            FloatingAnchorShape.SQUARE -> UiStrings.shapeSquare(lang)
+                            FloatingAnchorShape.CIRCLE -> UiStrings.shapeCircle(lang)
+                        }
+                        Toast.makeText(this@MainActivity, UiStrings.toastAnchorShapeChanged(lang, shapeName), Toast.LENGTH_SHORT).show()
+                        return true
+                    }
+                } else if (factor > 1.22f) { // Spread out
+                    val nextShape = when (currentAnchorShape) {
+                        FloatingAnchorShape.CIRCLE -> FloatingAnchorShape.SQUARE
+                        FloatingAnchorShape.SQUARE -> FloatingAnchorShape.PILL
+                        FloatingAnchorShape.PILL -> null
+                    }
+                    if (nextShape != null) {
+                        lastMorphTime = now
+                        floatingSecurityAnchor.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                        applyAnchorShape(nextShape)
+                        val lang = app.uiLanguageManager.language.value
+                        val shapeName = when (nextShape) {
+                            FloatingAnchorShape.PILL -> UiStrings.shapePill(lang)
+                            FloatingAnchorShape.SQUARE -> UiStrings.shapeSquare(lang)
+                            FloatingAnchorShape.CIRCLE -> UiStrings.shapeCircle(lang)
+                        }
+                        Toast.makeText(this@MainActivity, UiStrings.toastAnchorShapeChanged(lang, shapeName), Toast.LENGTH_SHORT).show()
+                        return true
+                    }
+                }
+                return false
+            }
+        })
+
         floatingSecurityAnchor.setOnTouchListener { view, event ->
+            scaleDetector.onTouchEvent(event)
+            if (event.pointerCount > 1) {
+                isClick = false
+            }
+
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     dX = view.x - event.rawX
@@ -433,31 +658,51 @@ class MainActivity : AppCompatActivity() {
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    val dist = Math.hypot((event.rawX - startX).toDouble(), (event.rawY - startY).toDouble())
-                    if (dist > 15) {
-                        isClick = false
-                        val parent = view.parent as? View
-                        val maxX = (parent?.width ?: 0) - view.width
-                        val maxY = (parent?.height ?: 0) - view.height
-                        val newX = (event.rawX + dX).coerceIn(0f, maxX.toFloat())
-                        val newY = (event.rawY + dY).coerceIn(0f, maxY.toFloat())
-                        view.x = newX
-                        view.y = newY
+                    if (event.pointerCount == 1 && !scaleDetector.isInProgress) {
+                        val dist = Math.hypot((event.rawX - startX).toDouble(), (event.rawY - startY).toDouble())
+                        if (dist > 15) {
+                            isClick = false
+                            val parent = view.parent as? View
+                            val maxX = (parent?.width ?: 0) - view.width
+                            val maxY = (parent?.height ?: 0) - view.height
+                            val newX = (event.rawX + dX).coerceIn(0f, maxX.toFloat())
+                            val newY = (event.rawY + dY).coerceIn(0f, maxY.toFloat())
+                            view.x = newX
+                            view.y = newY
+                        }
                     }
                     true
                 }
                 MotionEvent.ACTION_UP -> {
-                    if (isClick) {
-                        val rect = Rect()
-                        tvFloatingAnchorAccount.getGlobalVisibleRect(rect)
-                        if (rect.contains(event.rawX.toInt(), event.rawY.toInt())) {
-                            tvFloatingAnchorAccount.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
-                            showAccountDialog()
-                        } else {
-                            view.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
-                            setTopBarCollapsed(false)
+                    if (isClick && !scaleDetector.isInProgress) {
+                        if (currentAnchorShape == FloatingAnchorShape.PILL) {
+                            val rect = Rect()
+                            tvFloatingAnchorAccount.getGlobalVisibleRect(rect)
+                            if (rect.contains(event.rawX.toInt(), event.rawY.toInt())) {
+                                tvFloatingAnchorAccount.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                                showAccountDialog()
+                                return@setOnTouchListener true
+                            }
                         }
-                    } else {
+
+                        val now = System.currentTimeMillis()
+                        if (now - lastAnchorTapTime < 280L) {
+                            pendingSingleTapRunnable?.let { mainHandler.removeCallbacks(it) }
+                            pendingSingleTapRunnable = null
+                            lastAnchorTapTime = 0L
+                            view.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                            cycleAnchorShape()
+                        } else {
+                            lastAnchorTapTime = now
+                            pendingSingleTapRunnable?.let { mainHandler.removeCallbacks(it) }
+                            val runnable = Runnable {
+                                view.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                                setTopBarCollapsed(false)
+                            }
+                            pendingSingleTapRunnable = runnable
+                            mainHandler.postDelayed(runnable, 260L)
+                        }
+                    } else if (!scaleDetector.isInProgress) {
                         snapAnchorToNearestEdge(view)
                     }
                     true
@@ -467,6 +712,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         floatingSecurityAnchor.setOnLongClickListener {
+            pendingSingleTapRunnable?.let { mainHandler.removeCallbacks(it) }
+            pendingSingleTapRunnable = null
             it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
             showDiagnosticsDialog()
             true
@@ -922,6 +1169,8 @@ class MainActivity : AppCompatActivity() {
     ) {
         btnAccountSwitcher.text = UiStrings.btnAccountSelector(lang, profile.displayName)
         tvFloatingAnchorAccount.text = "• 👤 ${profile.displayName} ▾"
+        val initial = profile.displayName.trim().take(1).uppercase(Locale.ROOT).ifBlank { "👤" }
+        tvAnchorMiniBadge.text = initial
     }
 
     private fun createCardBackground(fillHex: String, strokeHex: String, radiusDp: Float = 12f): GradientDrawable {
@@ -1282,7 +1531,7 @@ class MainActivity : AppCompatActivity() {
         if (isUnresponsive) {
             vpnStatusBar.setBackgroundColor(Color.parseColor("#292012"))
             tvVpnStatus.setTextColor(Color.parseColor("#FBBF24"))
-            tvVpnStatus.text = UiStrings.statusLeakRiskConcise(lang)
+            tvVpnStatus.text = if (isTopBarMinimal) UiStrings.statusLeakRiskThin(lang) else UiStrings.statusLeakRiskConcise(lang)
             tvVpnSubStatus.text = UiStrings.subStatusActive(lang, state.interfaceName, proxyPort)
 
             viewAnchorDot.setBackgroundResource(R.drawable.bg_status_dot_yellow)
@@ -1291,7 +1540,7 @@ class MainActivity : AppCompatActivity() {
         } else {
             vpnStatusBar.setBackgroundColor(Color.parseColor("#161B22"))
             tvVpnStatus.setTextColor(Color.parseColor("#4ADE80"))
-            tvVpnStatus.text = UiStrings.statusProtectedConcise(lang)
+            tvVpnStatus.text = if (isTopBarMinimal) UiStrings.statusProtectedThin(lang, state.interfaceName, proxyPort) else UiStrings.statusProtectedConcise(lang)
             tvVpnSubStatus.text = UiStrings.subStatusActive(lang, state.interfaceName, proxyPort)
 
             viewAnchorDot.setBackgroundResource(R.drawable.bg_status_dot_green)
@@ -1303,7 +1552,7 @@ class MainActivity : AppCompatActivity() {
     private fun showDisconnectedBanner(proxyPort: Int, lang: UiLanguage) {
         vpnStatusBar.setBackgroundColor(Color.parseColor("#1F1315"))
         tvVpnStatus.setTextColor(Color.parseColor("#F87171"))
-        tvVpnStatus.text = UiStrings.statusBlockedConcise(lang)
+        tvVpnStatus.text = if (isTopBarMinimal) UiStrings.statusBlockedThin(lang) else UiStrings.statusBlockedConcise(lang)
         tvVpnSubStatus.text = UiStrings.subStatusOffline(lang, proxyPort)
 
         viewAnchorDot.setBackgroundResource(R.drawable.bg_status_dot_red)
@@ -1551,6 +1800,25 @@ class MainActivity : AppCompatActivity() {
             webView?.reload()
         }
 
+        val btnToggleBarSize = createActionButton(
+            if (isTopBarMinimal) UiStrings.btnExpandBar(lang) else UiStrings.btnThinBar(lang)
+        ) {
+            setTopBarMinimal(!isTopBarMinimal)
+            dialogRef?.dismiss()
+            showDiagnosticsDialog()
+        }
+
+        val currentShapeName = when (currentAnchorShape) {
+            FloatingAnchorShape.PILL -> UiStrings.shapePill(lang)
+            FloatingAnchorShape.SQUARE -> UiStrings.shapeSquare(lang)
+            FloatingAnchorShape.CIRCLE -> UiStrings.shapeCircle(lang)
+        }
+        val btnShape = createActionButton(UiStrings.btnAnchorShape(lang, currentShapeName)) {
+            cycleAnchorShape()
+            dialogRef?.dismiss()
+            showDiagnosticsDialog()
+        }
+
         val btnVersions = createActionButton(UiStrings.btnVersions(lang)) {
             showVersionsDetailDialog(lang, versions)
         }
@@ -1601,6 +1869,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         contentLayout.addView(btnReload)
+        contentLayout.addView(btnToggleBarSize)
+        contentLayout.addView(btnShape)
         contentLayout.addView(btnVersions)
         contentLayout.addView(btnToggleSecure)
         contentLayout.addView(btnCopy)
@@ -1801,6 +2071,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        pendingSingleTapRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingSingleTapRunnable = null
         releaseBackgroundWakeLock()
         bannerFlashJob?.cancel()
 
@@ -1827,6 +2099,8 @@ class MainActivity : AppCompatActivity() {
         private const val DIAGNOSTIC_URL = "https://browserleaks.com/ip"
         private const val PREFS_UI_COLLAPSE = "claudecage_ui_collapse_prefs"
         private const val KEY_TOPBAR_COLLAPSED = "is_top_bar_collapsed"
+        private const val KEY_TOPBAR_MINIMAL = "is_top_bar_minimal"
+        private const val KEY_ANCHOR_SHAPE = "floating_anchor_shape"
         private const val KEY_ANCHOR_X = "anchor_x"
         private const val KEY_ANCHOR_Y = "anchor_y"
         private const val PREFS_SECURITY_SETTINGS = "claudecage_security_prefs"

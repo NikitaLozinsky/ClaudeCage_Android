@@ -7,7 +7,7 @@
 ## 1. Общие Сведения о Проекте (Project Overview)
 
 - **Название приложения:** `ClaudeCage` (пакет: `com.example.claudecageand`).
-- **Текущая версия:** `1.3 (Build 4)` • **Hardening:** `Stage 10.2: Zero-Trust Hardening & Production Hotfix (JavaBridge Threading, Smart WakeLock, Fallback Cookie Purge)`.
+- **Текущая версия:** `1.3 (Build 4)` • **Hardening:** `Stage 10.3: Zero-Trust Hardening, W3C Notifications & Minimalist Dynamic Morphing Anchor`.
 - **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36).
 - **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37).
 - **Целевой VPN-клиент:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray).
@@ -82,6 +82,10 @@
     - Нативный шлюз `ClaudeCageNotificationBridge` фильтрует origin, выводит Heads-Up уведомления (`IMPORTANCE_HIGH`) с `BigTextStyle` и пробрасывает клики в чат (`window.__dispatchNotificationClick`).
     - **Smart `PARTIAL_WAKE_LOCK`:** в `MainActivity.onStop()` WakeLock захватывается исключительно при наличии свежего сетевого трафика через прокси за последние 15 секунд (`hasRecentTraffic(15_000L)` на базе отслеживания байтов в `pipe()`), что устраняет ложные срабатывания и разрядку батареи из-за неактивных keep-alive пулов Chromium.
     - **Комплексный сброс сессии (`purgeProfileSession`):** точечно очищает `ProfileStore`, кэш рендерера и аппаратный Keystore Fallback Cookie Jar (`deleteCookies(profile.id)`), а в статус-бар вынесена кнопка быстрой перезагрузки страницы `btnReload` (`🔄`).
+12. **Минималистичная ультратонкая панель и динамический морфинг якоря безопасности:**
+    - Верхняя панель переключается в тонкий режим (высота 26dp вместо 42dp, отступы 2dp), скрывая все избыточные кнопки и вторую строку статуса, оставляя чистый индикатор со статусом, кнопку перезагрузки `🔄`, переключатель размера `⤢`/`⤡` и сворачивания `▲`. Клик по тексту статуса открывает диалог диагностики.
+    - В свёрнутом режиме плавающий якорь безопасности морфится между тремя формами: `PILL` (капсула со статусом и аккаунтом), `SQUARE` (38x38dp скругленный квадрат со статусной точкой и первой буквой имени аккаунта), `CIRCLE` (34x34dp круг только со статусной точкой по центру).
+    - Морфинг управляется пальцами в реальном времени: мультитач 2 пальцами (pinch-in уменьшает форму Pill $\to$ Square $\to$ Circle; spread-out увеличивает форму Circle $\to$ Square $\to$ Pill) или двойной тап 1 пальцем (double-tap с дебаунсингом 260мс циклически переключает форму). Снаппинг к краям экрана учитывает габариты активной формы. Состояния сохраняются в SharedPreferences.
 
 ---
 

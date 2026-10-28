@@ -23,12 +23,15 @@
 
         <!-- Status chip / text container -->
         <LinearLayout
+            android:id="@+id/layoutStatusText"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:orientation="vertical"
             android:gravity="center_vertical"
-            android:paddingEnd="6dp">
+            android:paddingEnd="6dp"
+            android:clickable="true"
+            android:focusable="true">
 
             <TextView
                 android:id="@+id/tvVpnStatus"
@@ -126,6 +129,20 @@
             android:textStyle="bold"
             android:text="🔄" />
 
+        <!-- Toggle Top Bar Thin / Full mode -->
+        <TextView
+            android:id="@+id/btnBarSizeToggle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingHorizontal="7dp"
+            android:paddingVertical="4dp"
+            android:layout_marginEnd="4dp"
+            android:background="#1F2937"
+            android:textColor="#94A3B8"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:text="⤡" />
+
         <!-- Collapse top bar button -->
         <TextView
             android:id="@+id/btnCollapseBar"
@@ -177,6 +194,17 @@
                 android:layout_height="7dp"
                 android:layout_marginEnd="6dp"
                 android:background="@drawable/bg_status_dot_green" />
+
+            <!-- Compact badge for Square mode (e.g. Account initial) -->
+            <TextView
+                android:id="@+id/tvAnchorMiniBadge"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="#E2E8F0"
+                android:textSize="11sp"
+                android:textStyle="bold"
+                android:visibility="gone"
+                android:text="🛡️" />
 
             <TextView
                 android:id="@+id/tvFloatingAnchorStatus"

@@ -93,6 +93,18 @@ class UiStringsAndLanguageTest {
             assertTrue(UiStrings.confirmPurgeSessionTitle(lang).isNotBlank())
             assertTrue(UiStrings.confirmPurgeSessionMsg(lang, "Work").isNotBlank())
             assertTrue(UiStrings.toastSessionPurged(lang).isNotBlank())
+
+            // Thin Status Bar & Customizable Anchor Shapes
+            assertTrue(UiStrings.statusProtectedThin(lang, "tun0", 9050).isNotBlank())
+            assertTrue(UiStrings.statusLeakRiskThin(lang).isNotBlank())
+            assertTrue(UiStrings.statusBlockedThin(lang).isNotBlank())
+            assertTrue(UiStrings.btnThinBar(lang).isNotBlank())
+            assertTrue(UiStrings.btnExpandBar(lang).isNotBlank())
+            assertTrue(UiStrings.shapePill(lang).isNotBlank())
+            assertTrue(UiStrings.shapeSquare(lang).isNotBlank())
+            assertTrue(UiStrings.shapeCircle(lang).isNotBlank())
+            assertTrue(UiStrings.btnAnchorShape(lang, "Circle").isNotBlank())
+            assertTrue(UiStrings.toastAnchorShapeChanged(lang, "Circle").isNotBlank())
         }
     }
 

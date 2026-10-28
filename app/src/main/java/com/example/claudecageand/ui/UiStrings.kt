@@ -393,4 +393,54 @@ object UiStrings {
         UiLanguage.RU -> "Кэш и сессия профиля очищены!"
         UiLanguage.EN -> "Profile cache and session purged!"
     }
+
+    fun statusProtectedThin(lang: UiLanguage, iface: String, port: Int): String = when (lang) {
+        UiLanguage.RU -> "🟢 $iface • 127.0.0.1:$port"
+        UiLanguage.EN -> "🟢 $iface • 127.0.0.1:$port"
+    }
+
+    fun statusLeakRiskThin(lang: UiLanguage): String = when (lang) {
+        UiLanguage.RU -> "🟡 Задержка туннеля (SOCKS5)"
+        UiLanguage.EN -> "🟡 Tunnel Unresponsive"
+    }
+
+    fun statusBlockedThin(lang: UiLanguage): String = when (lang) {
+        UiLanguage.RU -> "🔴 Сеть заблокирована (Kill-Switch)"
+        UiLanguage.EN -> "🔴 Traffic Blocked (Kill-Switch)"
+    }
+
+    fun btnThinBar(lang: UiLanguage): String = when (lang) {
+        UiLanguage.RU -> "⤡ Тонкая панель статуса (Минимализм)"
+        UiLanguage.EN -> "⤡ Minimalist Thin Status Bar"
+    }
+
+    fun btnExpandBar(lang: UiLanguage): String = when (lang) {
+        UiLanguage.RU -> "⤢ Развернуть панель статуса"
+        UiLanguage.EN -> "⤢ Expand Full Status Bar"
+    }
+
+    fun shapePill(lang: UiLanguage): String = when (lang) {
+        UiLanguage.RU -> "Капсула"
+        UiLanguage.EN -> "Pill"
+    }
+
+    fun shapeSquare(lang: UiLanguage): String = when (lang) {
+        UiLanguage.RU -> "Квадрат"
+        UiLanguage.EN -> "Square"
+    }
+
+    fun shapeCircle(lang: UiLanguage): String = when (lang) {
+        UiLanguage.RU -> "Круг"
+        UiLanguage.EN -> "Circle"
+    }
+
+    fun btnAnchorShape(lang: UiLanguage, shape: String): String = when (lang) {
+        UiLanguage.RU -> "🎛️ Форма плавающей кнопки: $shape"
+        UiLanguage.EN -> "🎛️ Anchor Shape: $shape"
+    }
+
+    fun toastAnchorShapeChanged(lang: UiLanguage, shape: String): String = when (lang) {
+        UiLanguage.RU -> "Форма плавающего якоря: $shape"
+        UiLanguage.EN -> "Anchor shape: $shape"
+    }
 }
