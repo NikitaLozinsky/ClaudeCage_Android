@@ -305,6 +305,7 @@ class MainActivity : AppCompatActivity() {
             if (savedX >= 0f && savedY >= 0f) {
                 floatingSecurityAnchor.x = savedX
                 floatingSecurityAnchor.y = savedY
+                clampAndSaveAnchorPosition(floatingSecurityAnchor)
             }
         }
 
@@ -581,7 +582,7 @@ class MainActivity : AppCompatActivity() {
         prefs.edit().putInt(KEY_ANCHOR_SHAPE, shape.id).apply()
 
         floatingSecurityAnchor.post {
-            snapAnchorToNearestEdge(floatingSecurityAnchor)
+            clampAndSaveAnchorPosition(floatingSecurityAnchor)
         }
     }
 
@@ -670,10 +671,13 @@ class MainActivity : AppCompatActivity() {
                         if (dist > 15) {
                             isClick = false
                             val parent = view.parent as? View
-                            val maxX = (parent?.width ?: 0) - view.width
-                            val maxY = (parent?.height ?: 0) - view.height
-                            val newX = (event.rawX + dX).coerceIn(0f, maxX.toFloat())
-                            val newY = (event.rawY + dY).coerceIn(0f, maxY.toFloat())
+                            val parentWidth = parent?.width?.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+                            val parentHeight = parent?.height?.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+                            val margin = (4 * resources.displayMetrics.density)
+                            val maxX = (parentWidth - view.width - margin).coerceAtLeast(margin)
+                            val maxY = (parentHeight - view.height - margin).coerceAtLeast(margin)
+                            val newX = (event.rawX + dX).coerceIn(margin, maxX)
+                            val newY = (event.rawY + dY).coerceIn(margin, maxY)
                             view.x = newX
                             view.y = newY
                         }
@@ -690,7 +694,7 @@ class MainActivity : AppCompatActivity() {
                     if (dist > (32 * density) && Math.abs(deltaX) > Math.abs(deltaY) * 1.4) {
                         isClick = false
                         cycleAnchorShape()
-                        snapAnchorToNearestEdge(view)
+                        clampAndSaveAnchorPosition(view)
                         return@setOnTouchListener true
                     }
 
@@ -735,7 +739,7 @@ class MainActivity : AppCompatActivity() {
                             mainHandler.postDelayed(runnable, 170L)
                         }
                     } else if (!scaleDetector.isInProgress) {
-                        snapAnchorToNearestEdge(view)
+                        clampAndSaveAnchorPosition(view)
                     }
                     true
                 }
@@ -752,30 +756,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun snapAnchorToNearestEdge(view: View) {
+    private fun clampAndSaveAnchorPosition(view: View) {
         val parent = view.parent as? View
         val parentWidth = parent?.width?.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
-        val marginPx = (12 * resources.displayMetrics.density)
-        val viewWidth = view.width.toFloat()
-        val centerX = view.x + (viewWidth / 2f)
+        val parentHeight = parent?.height?.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels
+        val marginPx = 4 * resources.displayMetrics.density
+        val maxX = (parentWidth - view.width - marginPx).coerceAtLeast(marginPx)
+        val maxY = (parentHeight - view.height - marginPx).coerceAtLeast(marginPx)
 
-        val targetX = if (centerX < parentWidth / 2f) {
-            marginPx
-        } else {
-            (parentWidth - viewWidth - marginPx).coerceAtLeast(marginPx)
-        }
+        val targetX = view.x.coerceIn(marginPx, maxX)
+        val targetY = view.y.coerceIn(marginPx, maxY)
 
-        view.animate()
-            .x(targetX)
-            .setDuration(220)
-            .withEndAction {
-                val prefs = getSharedPreferences(PREFS_UI_COLLAPSE, Context.MODE_PRIVATE)
-                prefs.edit()
-                    .putFloat(KEY_ANCHOR_X, targetX)
-                    .putFloat(KEY_ANCHOR_Y, view.y)
-                    .apply()
-            }
-            .start()
+        view.x = targetX
+        view.y = targetY
+
+        val prefs = getSharedPreferences(PREFS_UI_COLLAPSE, Context.MODE_PRIVATE)
+        prefs.edit()
+            .putFloat(KEY_ANCHOR_X, targetX)
+            .putFloat(KEY_ANCHOR_Y, targetY)
+            .apply()
     }
 
     private fun setupBackNavigation() {
