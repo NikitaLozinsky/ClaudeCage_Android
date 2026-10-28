@@ -1010,7 +1010,11 @@ class MainActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
                 currentWebViewUrl = url ?: CLAUDE_URL
-                if (url?.contains("browserleaks.com") == true) {
+                if (url?.contains("browserleaks.com") == true ||
+                    url?.contains("withpersona.com") == true ||
+                    url?.contains("persona.com") == true ||
+                    url?.contains("stripe.com") == true
+                ) {
                     btnReturnToClaude.visibility = View.VISIBLE
                 } else if (url?.contains("claude.ai") == true) {
                     btnReturnToClaude.visibility = View.GONE
@@ -1020,6 +1024,15 @@ class MainActivity : AppCompatActivity() {
             override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
                 super.doUpdateVisitedHistory(view, url, isReload)
                 currentWebViewUrl = url ?: CLAUDE_URL
+                if (url?.contains("browserleaks.com") == true ||
+                    url?.contains("withpersona.com") == true ||
+                    url?.contains("persona.com") == true ||
+                    url?.contains("stripe.com") == true
+                ) {
+                    btnReturnToClaude.visibility = View.VISIBLE
+                } else if (url?.contains("claude.ai") == true) {
+                    btnReturnToClaude.visibility = View.GONE
+                }
             }
         }
 
