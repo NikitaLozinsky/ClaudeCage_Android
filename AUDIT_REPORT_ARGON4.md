@@ -1,10 +1,10 @@
 # Комплексный Технический Отчёт и Архитектурный Аудит ClaudeCage
-## Stage 10: Zero-Trust Hardening & Anti-Fraud Bypass Architecture
+## Stage 11: Kernel Dead-Network Lock, Client Hints & Stealth Dynamic Island UI
 
 **Целевая аудитория аудита:** Gemini Argon 4 (Frontier Reasoning & Security Architecture Model)  
-**Дата актуализации:** 27 октября 2026 г.  
+**Дата актуализации:** 28 октября 2026 г.  
 **Проект:** `ClaudeCage` (пакет: `com.example.claudecageand`)  
-**Текущая версия:** `1.3 (Build 4)` • **Уровень харденинга:** `Stage 10.3: Zero-Trust Hardening, W3C Notifications & Minimalist Dynamic Morphing Anchor`  
+**Текущая версия:** `1.4 (Build 5)` • **Уровень харденинга:** `Stage 11: Kernel Dead-Network Lock, Client Hints & Stealth Dynamic Island UI`  
 **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36)  
 **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37)  
 **Целевой сетевой туннель:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray)  
@@ -263,6 +263,10 @@
 | **Фон при генерации** | Заморозка cgroup freezer | Заморозка / разрыв SSE | **Smart `PARTIAL_WAKE_LOCK` (только при трафике < 15с)** |
 | **Управление сессией** | Только удаление профиля | Только удаление профиля | **Комплексный сброс: ProfileStore + Fallback Jar + 🔄 Reload** |
 | **Интерфейс & Панель** | Фиксированная 42dp | Фиксированная 42dp | **Тонкая панель 26dp + Pinch-to-Morph якорь (Pill/Square/Circle)** |
+| **Блокировка утечек Ядра** | bindProcessToNetwork(null) | bindProcessToNetwork(null) | **Kernel Dead-Network Pinning (ENETUNREACH)** |
+| **Client Hints (UserAgent)**| Утечка реального Webview | Утечка реального Webview | **navigator.userAgentData (SM-S938B/Chrome)** |
+| **WebGL & Audio Noise**    | Детерминированный отпечаток | Детерминированный отпечаток | **AudioBuffer + WebGL readPixels Micro-Noise** |
+| **Сетка Действий Диалога** | 11 вертикальных кнопок снизу | 11 вертикальных кнопок снизу | **2-Колоночная сетка 6x2 вверху диалога** |
 
 ---
 
@@ -1671,8 +1675,13 @@ class VpnStateMonitor(
 
     /**
      * Publishes tunnel state synchronously under [stateLock], updating generation,
-     * binding or unbinding process network via [ConnectivityManager.bindProcessToNetwork],
+     * binding process network via [ConnectivityManager.bindProcessToNetwork] when Connected,
      * and immediately notifying all [TunnelListener]s.
+     *
+     * KERNEL DEAD-NETWORK PINNING (Stage 11):
+     * When VPN drops, NEVER unbind the process (never call bindProcessToNetwork(null))!
+     * Leaving the process bound to the disconnected Network handle causes the Linux
+     * kernel (netd) to reject all outbound non-loopback sockets with ENETUNREACH.
      */
     private fun publishState(next: VpnTunnelState) {
         synchronized(stateLock) {
@@ -1695,7 +1704,11 @@ class VpnStateMonitor(
                 }
                 _vpnState.value = VpnTunnelState.Disconnected
                 recordStateTelemetry(VpnTunnelState.Disconnected)
-                runCatching { connectivityManager.bindProcessToNetwork(null) }
+                // KERNEL DEAD-NETWORK PINNING (Stage 11):
+                // Deliberately do NOT call bindProcessToNetwork(null).
+                // Keeping the process pinned to the dead Network ensures the kernel refuses
+                // all outbound traffic with ENETUNREACH, preventing any cleartext leak
+                // to physical cellular / Wi-Fi interfaces.
                 for (listener in tunnelListeners) {
                     runCatching { listener.onTunnelChanged(prev, VpnTunnelState.Disconnected) }
                 }
@@ -2005,6 +2018,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Rect
 import android.graphics.Typeface
@@ -2015,6 +2029,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.transition.TransitionManager
 import android.util.Base64
 import android.util.Log
 import android.view.Gravity
@@ -2129,6 +2144,7 @@ class MainActivity : AppCompatActivity() {
     private var isTopBarCollapsed: Boolean = false
     private var isTopBarMinimal: Boolean = false
     private var currentAnchorShape: FloatingAnchorShape = FloatingAnchorShape.PILL
+    private var currentAnchorBorderColorHex: String = "#554ADE80"
     private val mainHandler = Handler(Looper.getMainLooper())
     private var pendingSingleTapRunnable: Runnable? = null
     private var lastAnchorTapTime: Long = 0L
@@ -2473,9 +2489,9 @@ class MainActivity : AppCompatActivity() {
             )
             tvVpnSubStatus.visibility = View.VISIBLE
             tvVpnStatus.textSize = 12f
-            btnDiagnostics.visibility = View.VISIBLE
+            btnDiagnostics.visibility = View.GONE
             btnAccountSwitcher.visibility = View.VISIBLE
-            btnLangToggle.visibility = View.VISIBLE
+            btnLangToggle.visibility = View.GONE
             btnBarSizeToggle.text = "⤡"
         }
 
@@ -2488,21 +2504,37 @@ class MainActivity : AppCompatActivity() {
         prefs.edit().putBoolean(KEY_TOPBAR_MINIMAL, minimal).apply()
     }
 
+    private fun updateFloatingAnchorAppearance(borderColorHex: String? = null) {
+        if (borderColorHex != null) {
+            currentAnchorBorderColorHex = borderColorHex
+        }
+        val density = resources.displayMetrics.density
+        val radius = when (currentAnchorShape) {
+            FloatingAnchorShape.PILL -> 20f * density
+            FloatingAnchorShape.SQUARE -> 8f * density
+            FloatingAnchorShape.CIRCLE -> 24f * density
+        }
+        val bg = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = radius
+            setColor(Color.parseColor("#EB0D1117"))
+            setStroke((1.2f * density).toInt().coerceAtLeast(1), Color.parseColor(currentAnchorBorderColorHex))
+        }
+        floatingSecurityAnchor.background = bg
+    }
+
     private fun applyAnchorShape(shape: FloatingAnchorShape, animate: Boolean = true) {
         currentAnchorShape = shape
         val density = resources.displayMetrics.density
 
-        val bg = GradientDrawable().apply {
-            this.shape = GradientDrawable.RECTANGLE
-            cornerRadius = when (shape) {
-                FloatingAnchorShape.PILL -> 20f * density
-                FloatingAnchorShape.SQUARE -> 8f * density
-                FloatingAnchorShape.CIRCLE -> 24f * density
+        val prevX = floatingSecurityAnchor.x
+        val prevY = floatingSecurityAnchor.y
+
+        if (animate) {
+            (floatingSecurityAnchor.parent as? ViewGroup)?.let {
+                TransitionManager.beginDelayedTransition(it)
             }
-            setColor(Color.parseColor("#E6161B22"))
-            setStroke((1 * density).toInt(), Color.parseColor("#38BDF8"))
         }
-        floatingSecurityAnchor.background = bg
 
         val dotParams = viewAnchorDot.layoutParams as LinearLayout.LayoutParams
         val activeProfile = app.accountProfileManager.activeProfile.value
@@ -2553,6 +2585,11 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        floatingSecurityAnchor.x = prevX
+        floatingSecurityAnchor.y = prevY
+
+        updateFloatingAnchorAppearance()
+
         val prefs = getSharedPreferences(PREFS_UI_COLLAPSE, Context.MODE_PRIVATE)
         prefs.edit().putInt(KEY_ANCHOR_SHAPE, shape.id).apply()
 
@@ -2567,15 +2604,8 @@ class MainActivity : AppCompatActivity() {
             FloatingAnchorShape.SQUARE -> FloatingAnchorShape.CIRCLE
             FloatingAnchorShape.CIRCLE -> FloatingAnchorShape.PILL
         }
-        floatingSecurityAnchor.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+        floatingSecurityAnchor.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
         applyAnchorShape(next)
-        val lang = app.uiLanguageManager.language.value
-        val shapeName = when (next) {
-            FloatingAnchorShape.PILL -> UiStrings.shapePill(lang)
-            FloatingAnchorShape.SQUARE -> UiStrings.shapeSquare(lang)
-            FloatingAnchorShape.CIRCLE -> UiStrings.shapeCircle(lang)
-        }
-        Toast.makeText(this, UiStrings.toastAnchorShapeChanged(lang, shapeName), Toast.LENGTH_SHORT).show()
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -2587,7 +2617,12 @@ class MainActivity : AppCompatActivity() {
         var isClick = false
 
         tvFloatingAnchorAccount.setOnClickListener {
-            it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+            it.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+            showAccountDialog()
+        }
+
+        tvAnchorMiniBadge.setOnClickListener {
+            it.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
             showAccountDialog()
         }
 
@@ -2607,15 +2642,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     if (nextShape != null) {
                         lastMorphTime = now
-                        floatingSecurityAnchor.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
-                        applyAnchorShape(nextShape)
-                        val lang = app.uiLanguageManager.language.value
-                        val shapeName = when (nextShape) {
-                            FloatingAnchorShape.PILL -> UiStrings.shapePill(lang)
-                            FloatingAnchorShape.SQUARE -> UiStrings.shapeSquare(lang)
-                            FloatingAnchorShape.CIRCLE -> UiStrings.shapeCircle(lang)
-                        }
-                        Toast.makeText(this@MainActivity, UiStrings.toastAnchorShapeChanged(lang, shapeName), Toast.LENGTH_SHORT).show()
+                        cycleAnchorShape()
                         return true
                     }
                 } else if (factor > 1.22f) { // Spread out
@@ -2626,15 +2653,8 @@ class MainActivity : AppCompatActivity() {
                     }
                     if (nextShape != null) {
                         lastMorphTime = now
-                        floatingSecurityAnchor.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
                         applyAnchorShape(nextShape)
-                        val lang = app.uiLanguageManager.language.value
-                        val shapeName = when (nextShape) {
-                            FloatingAnchorShape.PILL -> UiStrings.shapePill(lang)
-                            FloatingAnchorShape.SQUARE -> UiStrings.shapeSquare(lang)
-                            FloatingAnchorShape.CIRCLE -> UiStrings.shapeCircle(lang)
-                        }
-                        Toast.makeText(this@MainActivity, UiStrings.toastAnchorShapeChanged(lang, shapeName), Toast.LENGTH_SHORT).show()
+                        floatingSecurityAnchor.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                         return true
                     }
                 }
@@ -2674,33 +2694,58 @@ class MainActivity : AppCompatActivity() {
                     true
                 }
                 MotionEvent.ACTION_UP -> {
+                    val density = resources.displayMetrics.density
+                    val deltaX = event.rawX - startX
+                    val deltaY = event.rawY - startY
+                    val dist = Math.hypot(deltaX.toDouble(), deltaY.toDouble())
+
+                    // Horizontal fling/swipe gesture detection to cycle shape smoothly
+                    if (dist > (32 * density) && Math.abs(deltaX) > Math.abs(deltaY) * 1.4) {
+                        isClick = false
+                        cycleAnchorShape()
+                        snapAnchorToNearestEdge(view)
+                        return@setOnTouchListener true
+                    }
+
                     if (isClick && !scaleDetector.isInProgress) {
+                        // Quick click on account badge in PILL mode
                         if (currentAnchorShape == FloatingAnchorShape.PILL) {
                             val rect = Rect()
                             tvFloatingAnchorAccount.getGlobalVisibleRect(rect)
                             if (rect.contains(event.rawX.toInt(), event.rawY.toInt())) {
-                                tvFloatingAnchorAccount.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                                tvFloatingAnchorAccount.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                showAccountDialog()
+                                return@setOnTouchListener true
+                            }
+                        }
+
+                        // Quick click on account monogram badge in SQUARE mode
+                        if (currentAnchorShape == FloatingAnchorShape.SQUARE) {
+                            val rect = Rect()
+                            tvAnchorMiniBadge.getGlobalVisibleRect(rect)
+                            if (rect.contains(event.rawX.toInt(), event.rawY.toInt())) {
+                                tvAnchorMiniBadge.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                                 showAccountDialog()
                                 return@setOnTouchListener true
                             }
                         }
 
                         val now = System.currentTimeMillis()
-                        if (now - lastAnchorTapTime < 280L) {
+                        if (now - lastAnchorTapTime < 240L) {
+                            // Double-tap confirmed! Cancel single-tap uncollapse and cycle shape instantly
                             pendingSingleTapRunnable?.let { mainHandler.removeCallbacks(it) }
                             pendingSingleTapRunnable = null
                             lastAnchorTapTime = 0L
-                            view.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
                             cycleAnchorShape()
                         } else {
                             lastAnchorTapTime = now
                             pendingSingleTapRunnable?.let { mainHandler.removeCallbacks(it) }
                             val runnable = Runnable {
-                                view.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                                view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                                 setTopBarCollapsed(false)
                             }
                             pendingSingleTapRunnable = runnable
-                            mainHandler.postDelayed(runnable, 260L)
+                            mainHandler.postDelayed(runnable, 170L)
                         }
                     } else if (!scaleDetector.isInProgress) {
                         snapAnchorToNearestEdge(view)
@@ -2714,7 +2759,7 @@ class MainActivity : AppCompatActivity() {
         floatingSecurityAnchor.setOnLongClickListener {
             pendingSingleTapRunnable?.let { mainHandler.removeCallbacks(it) }
             pendingSingleTapRunnable = null
-            it.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+            it.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
             showDiagnosticsDialog()
             true
         }
@@ -3495,6 +3540,7 @@ class MainActivity : AppCompatActivity() {
                     viewAnchorDot.setBackgroundResource(R.drawable.bg_status_dot_green)
                     tvFloatingAnchorStatus.text = UiStrings.statusRestored(lang)
                     tvFloatingAnchorStatus.setTextColor(Color.parseColor("#4ADE80"))
+                    updateFloatingAnchorAppearance("#554ADE80")
 
                     bannerFlashJob = lifecycleScope.launch {
                         delay(2000)
@@ -3537,6 +3583,7 @@ class MainActivity : AppCompatActivity() {
             viewAnchorDot.setBackgroundResource(R.drawable.bg_status_dot_yellow)
             tvFloatingAnchorStatus.text = UiStrings.statusLeakRiskConcise(lang)
             tvFloatingAnchorStatus.setTextColor(Color.parseColor("#FBBF24"))
+            updateFloatingAnchorAppearance("#88FBBF24")
         } else {
             vpnStatusBar.setBackgroundColor(Color.parseColor("#161B22"))
             tvVpnStatus.setTextColor(Color.parseColor("#4ADE80"))
@@ -3546,6 +3593,7 @@ class MainActivity : AppCompatActivity() {
             viewAnchorDot.setBackgroundResource(R.drawable.bg_status_dot_green)
             tvFloatingAnchorStatus.text = UiStrings.statusProtectedConcise(lang)
             tvFloatingAnchorStatus.setTextColor(Color.parseColor("#4ADE80"))
+            updateFloatingAnchorAppearance("#554ADE80")
         }
     }
 
@@ -3558,6 +3606,7 @@ class MainActivity : AppCompatActivity() {
         viewAnchorDot.setBackgroundResource(R.drawable.bg_status_dot_red)
         tvFloatingAnchorStatus.text = UiStrings.statusBlockedConcise(lang)
         tvFloatingAnchorStatus.setTextColor(Color.parseColor("#F87171"))
+        updateFloatingAnchorAppearance("#99F87171")
     }
 
     private fun refreshStatusBarText(state: VpnTunnelState, proxyPort: Int, lang: UiLanguage) {
@@ -3593,6 +3642,147 @@ class MainActivity : AppCompatActivity() {
         scrollView.addView(contentLayout)
 
         val density = resources.displayMetrics.density
+        var dialogRef: AlertDialog? = null
+        val versions = getComponentVersions()
+
+        // 2-Column Action Grid at the TOP of Diagnostics Dialog
+        val gridCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                setMargins(0, 0, 0, (8 * density).toInt())
+            }
+            background = createCardBackground("#161B22", "#30363D", 12f)
+            setPadding((6 * density).toInt(), (6 * density).toInt(), (6 * density).toInt(), (6 * density).toInt())
+        }
+
+        fun createGridButton(label: String, onClick: () -> Unit): MaterialButton {
+            return MaterialButton(this).apply {
+                text = label
+                textSize = 11f
+                isAllCaps = false
+                val padV = (8 * density).toInt()
+                val padH = (6 * density).toInt()
+                setPadding(padH, padV, padH, padV)
+                minHeight = 0
+                minimumHeight = (36 * density).toInt()
+                layoutParams = LinearLayout.LayoutParams(
+                    0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    1f
+                ).apply {
+                    val m = (3 * density).toInt()
+                    setMargins(m, m, m, m)
+                }
+                setOnClickListener { onClick() }
+            }
+        }
+
+        fun addGridRow(b1: MaterialButton, b2: MaterialButton) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            }
+            row.addView(b1)
+            row.addView(b2)
+            gridCard.addView(row)
+        }
+
+        val btnReload = createGridButton(if (lang == UiLanguage.RU) "🔄 Обновить" else "🔄 Reload") {
+            dialogRef?.dismiss()
+            webView?.reload()
+        }
+
+        val btnAccounts = createGridButton(if (lang == UiLanguage.RU) "👤 Аккаунты" else "👤 Accounts") {
+            dialogRef?.dismiss()
+            showAccountDialog()
+        }
+
+        val btnCopy = createGridButton(if (lang == UiLanguage.RU) "📋 Копировать" else "📋 Copy Report") {
+            copyAuditReportToClipboard()
+        }
+
+        val btnShare = createGridButton(if (lang == UiLanguage.RU) "📤 Поделиться" else "📤 Share") {
+            shareAuditReport()
+        }
+
+        val btnLeaks = createGridButton(if (lang == UiLanguage.RU) "🧪 BrowserLeaks" else "🧪 BrowserLeaks") {
+            dialogRef?.dismiss()
+            btnReturnToClaude.visibility = View.VISIBLE
+            currentWebViewUrl = DIAGNOSTIC_URL
+            webView?.loadUrl(DIAGNOSTIC_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
+        }
+
+        val btnClear = createGridButton(if (lang == UiLanguage.RU) "🧹 Сброс логов" else "🧹 Clear Logs") {
+            app.auditLogger.clearAllLogs()
+            dialogRef?.dismiss()
+            showDiagnosticsDialog()
+        }
+
+        val btnToggleBarSize = createGridButton(
+            if (isTopBarMinimal) (if (lang == UiLanguage.RU) "⤢ Панель макс" else "⤢ Expand Bar")
+            else (if (lang == UiLanguage.RU) "⤡ Панель мини" else "⤡ Thin Bar")
+        ) {
+            setTopBarMinimal(!isTopBarMinimal)
+            dialogRef?.dismiss()
+            showDiagnosticsDialog()
+        }
+
+        val currentShapeName = when (currentAnchorShape) {
+            FloatingAnchorShape.PILL -> UiStrings.shapePill(lang)
+            FloatingAnchorShape.SQUARE -> UiStrings.shapeSquare(lang)
+            FloatingAnchorShape.CIRCLE -> UiStrings.shapeCircle(lang)
+        }
+        val btnShape = createGridButton(if (lang == UiLanguage.RU) "🎛️ Форма: " else "🎛️ Shape: ") {
+            cycleAnchorShape()
+            dialogRef?.dismiss()
+            showDiagnosticsDialog()
+        }
+
+        val secPrefs = getSharedPreferences(PREFS_SECURITY_SETTINGS, Context.MODE_PRIVATE)
+        val isSecure = secPrefs.getBoolean(KEY_FLAG_SECURE, true)
+        val btnToggleSecure = createGridButton(
+            if (isSecure) (if (lang == UiLanguage.RU) "🛡️ Recents: ВКЛ" else "🛡️ Recents: ON")
+            else (if (lang == UiLanguage.RU) "🛡️ Recents: ВЫКЛ" else "🛡️ Recents: OFF")
+        ) {
+            val newSecure = !isSecure
+            secPrefs.edit().putBoolean(KEY_FLAG_SECURE, newSecure).apply()
+            if (newSecure) {
+                window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+            } else {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+            }
+            dialogRef?.dismiss()
+            showDiagnosticsDialog()
+        }
+
+        val btnIcon = createGridButton(if (lang == UiLanguage.RU) "🎨 Иконка" else "🎨 App Icon") {
+            showAppIconSelectionDialog(lang)
+        }
+
+        val btnVersions = createGridButton(if (lang == UiLanguage.RU) "📦 Версии" else "📦 Versions") {
+            showVersionsDetailDialog(lang, versions)
+        }
+
+        val btnLang = createGridButton(if (lang == UiLanguage.RU) "🌐 Язык: RU" else "🌐 Lang: EN") {
+            app.uiLanguageManager.toggleLanguage()
+            dialogRef?.dismiss()
+            showDiagnosticsDialog()
+        }
+
+        addGridRow(btnReload, btnAccounts)
+        addGridRow(btnCopy, btnShare)
+        addGridRow(btnLeaks, btnClear)
+        addGridRow(btnToggleBarSize, btnShape)
+        addGridRow(btnToggleSecure, btnIcon)
+        addGridRow(btnVersions, btnLang)
+
+        contentLayout.addView(gridCard)
 
         fun addSection(title: String, statusText: String, isSuccess: Boolean, explanation: String) {
             val card = LinearLayout(this).apply {
@@ -3633,7 +3823,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         // 0. Component & Platform Versions
-        val versions = getComponentVersions()
         addSection(
             UiStrings.sectionVersionsTitle(lang),
             versions.toFormattedSummary(),
@@ -3778,108 +3967,6 @@ class MainActivity : AppCompatActivity() {
         logsCard.addView(logsText)
         contentLayout.addView(logsCard)
 
-        // Dialog Action Buttons Container
-        var dialogRef: AlertDialog? = null
-
-        fun createActionButton(label: String, onClick: () -> Unit): MaterialButton {
-            return MaterialButton(this).apply {
-                text = label
-                textSize = 12f
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply {
-                    setMargins(0, 4, 0, 4)
-                }
-                setOnClickListener { onClick() }
-            }
-        }
-
-        val btnReload = createActionButton(if (lang == UiLanguage.RU) "🔄 Перезагрузить страницу" else "🔄 Reload Page") {
-            dialogRef?.dismiss()
-            webView?.reload()
-        }
-
-        val btnToggleBarSize = createActionButton(
-            if (isTopBarMinimal) UiStrings.btnExpandBar(lang) else UiStrings.btnThinBar(lang)
-        ) {
-            setTopBarMinimal(!isTopBarMinimal)
-            dialogRef?.dismiss()
-            showDiagnosticsDialog()
-        }
-
-        val currentShapeName = when (currentAnchorShape) {
-            FloatingAnchorShape.PILL -> UiStrings.shapePill(lang)
-            FloatingAnchorShape.SQUARE -> UiStrings.shapeSquare(lang)
-            FloatingAnchorShape.CIRCLE -> UiStrings.shapeCircle(lang)
-        }
-        val btnShape = createActionButton(UiStrings.btnAnchorShape(lang, currentShapeName)) {
-            cycleAnchorShape()
-            dialogRef?.dismiss()
-            showDiagnosticsDialog()
-        }
-
-        val btnVersions = createActionButton(UiStrings.btnVersions(lang)) {
-            showVersionsDetailDialog(lang, versions)
-        }
-
-        val secPrefs = getSharedPreferences(PREFS_SECURITY_SETTINGS, Context.MODE_PRIVATE)
-        val isSecure = secPrefs.getBoolean(KEY_FLAG_SECURE, true)
-        val btnToggleSecure = createActionButton(
-            if (lang == UiLanguage.RU) {
-                if (isSecure) "🛡️ Защита снимков экрана (Recents): ВКЛ" else "🛡️ Защита снимков экрана (Recents): ВЫКЛ"
-            } else {
-                if (isSecure) "🛡️ Privacy Screen (FLAG_SECURE): ON" else "🛡️ Privacy Screen (FLAG_SECURE): OFF"
-            }
-        ) {
-            val newSecure = !isSecure
-            secPrefs.edit().putBoolean(KEY_FLAG_SECURE, newSecure).apply()
-            if (newSecure) {
-                window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
-            } else {
-                window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
-            }
-            dialogRef?.dismiss()
-            showDiagnosticsDialog()
-        }
-
-        val btnCopy = createActionButton(UiStrings.btnCopyAiReport(lang)) {
-            copyAuditReportToClipboard()
-        }
-        val btnShare = createActionButton(UiStrings.btnShareLog(lang)) {
-            shareAuditReport()
-        }
-        val btnLeaks = createActionButton(UiStrings.btnBrowserLeaks(lang)) {
-            dialogRef?.dismiss()
-            btnReturnToClaude.visibility = View.VISIBLE
-            currentWebViewUrl = DIAGNOSTIC_URL
-            webView?.loadUrl(DIAGNOSTIC_URL, mapOf("Accept-Language" to "en-US,en;q=0.9"))
-        }
-        val btnClear = createActionButton(UiStrings.btnClearLogs(lang)) {
-            app.auditLogger.clearAllLogs()
-            dialogRef?.dismiss()
-            showDiagnosticsDialog()
-        }
-        val btnIcon = createActionButton(UiStrings.btnChangeIcon(lang)) {
-            showAppIconSelectionDialog(lang)
-        }
-        val btnAccounts = createActionButton(UiStrings.accountDialogTitle(lang)) {
-            dialogRef?.dismiss()
-            showAccountDialog()
-        }
-
-        contentLayout.addView(btnReload)
-        contentLayout.addView(btnToggleBarSize)
-        contentLayout.addView(btnShape)
-        contentLayout.addView(btnVersions)
-        contentLayout.addView(btnToggleSecure)
-        contentLayout.addView(btnCopy)
-        contentLayout.addView(btnShare)
-        contentLayout.addView(btnLeaks)
-        contentLayout.addView(btnClear)
-        contentLayout.addView(btnIcon)
-        contentLayout.addView(btnAccounts)
-
         dialogRef = MaterialAlertDialogBuilder(this)
             .setTitle(UiStrings.diagDialogTitle(lang))
             .setView(scrollView)
@@ -4010,7 +4097,7 @@ class MainActivity : AppCompatActivity() {
         return ComponentVersions(
             appVersionName = verName,
             appVersionCode = verCode,
-            stageHardening = "Stage 10.2: Zero-Trust Hardening & Production Hotfix",
+            stageHardening = "Stage 11: Kernel Dead-Network Lock, Client Hints & Dynamic Island UI",
             androidRelease = Build.VERSION.RELEASE,
             apiLevel = Build.VERSION.SDK_INT,
             securityPatch = patch,
@@ -4351,6 +4438,37 @@ object AntiFingerprintHardener {
                     } catch (e) {}
                     return origToBlob.call(this, callback, type, quality);
                 }, 'toBlob');
+
+                // 7.1 AudioBuffer getChannelData Micro-Noise
+                if (window.AudioBuffer && AudioBuffer.prototype.getChannelData) {
+                    const origGetChannelData = AudioBuffer.prototype.getChannelData;
+                    AudioBuffer.prototype.getChannelData = cloak(function(channel) {
+                        const buffer = origGetChannelData.call(this, channel);
+                        if (buffer && buffer.length > 0) {
+                            buffer[0] = buffer[0] + (1e-7 * NOISE_OFFSET);
+                        }
+                        return buffer;
+                    }, 'getChannelData');
+                }
+
+                // 7.2 WebGL readPixels Micro-Noise
+                const hookWebGLReadPixels = (proto) => {
+                    if (!proto || !proto.readPixels) return;
+                    const origReadPixels = proto.readPixels;
+                    proto.readPixels = cloak(function(x, y, width, height, format, type, pixels) {
+                        origReadPixels.call(this, x, y, width, height, format, type, pixels);
+                        if (pixels && pixels.length > 0) {
+                            for (let i = 0; i < pixels.length; i += 4) {
+                                if (pixels[i + 3] > 0 || pixels.length < 4) {
+                                    pixels[i] = (pixels[i] + NOISE_OFFSET) % 256;
+                                    break;
+                                }
+                            }
+                        }
+                    }, 'readPixels');
+                };
+                if (window.WebGLRenderingContext) hookWebGLReadPixels(WebGLRenderingContext.prototype);
+                if (window.WebGL2RenderingContext) hookWebGLReadPixels(WebGL2RenderingContext.prototype);
             } catch (e) {}
         """.trimIndent()
 
@@ -4614,6 +4732,48 @@ object AntiFingerprintHardener {
                         navigator.connection.onchange = null;
                     }
                 }
+            } catch (e) {}
+
+            // 10.5 Spoof User-Agent Client Hints (navigator.userAgentData) to hide Android WebView brand
+            try {
+                const uaMatch = navigator.userAgent.match(/Chrome\/(\d+)(\.\d+\.\d+\.\d+)?/);
+                const majorVer = uaMatch ? uaMatch[1] : '155';
+                const fullVer = uaMatch && uaMatch[2] ? (uaMatch[1] + uaMatch[2]) : (majorVer + '.0.0.0');
+                const brandsList = Object.freeze([
+                    Object.freeze({ brand: 'Not_A Brand', version: '24' }),
+                    Object.freeze({ brand: 'Chromium', version: majorVer }),
+                    Object.freeze({ brand: 'Google Chrome', version: majorVer })
+                ]);
+                const fullVersionList = Object.freeze([
+                    Object.freeze({ brand: 'Not_A Brand', version: '24.0.0.0' }),
+                    Object.freeze({ brand: 'Chromium', version: fullVer }),
+                    Object.freeze({ brand: 'Google Chrome', version: fullVer })
+                ]);
+                const fakeUaData = Object.freeze({
+                    brands: brandsList,
+                    mobile: true,
+                    platform: 'Android',
+                    toJSON: cloak(function() {
+                        return { brands: this.brands, mobile: this.mobile, platform: this.platform };
+                    }, 'toJSON'),
+                    getHighEntropyValues: cloak(function(hints) {
+                        return Promise.resolve({
+                            brands: brandsList,
+                            mobile: true,
+                            platform: 'Android',
+                            platformVersion: '16.0.0',
+                            architecture: 'arm',
+                            bitness: '64',
+                            model: 'SM-S938B',
+                            uaFullVersion: fullVer,
+                            fullVersionList: fullVersionList
+                        });
+                    }, 'getHighEntropyValues')
+                });
+                Object.defineProperty(navigator, 'userAgentData', {
+                    get: cloak(() => fakeUaData, 'get userAgentData'),
+                    configurable: false
+                });
             } catch (e) {}
 
             // 11. W3C Web Notification API Polyfill & Native Bridge
@@ -5884,7 +6044,7 @@ data class AccountProfile(
 ```
 
 ### 5.13. `app/build.gradle.kts`
-**Назначение и роль в безопасности:** Конфигурация сборки Gradle: зависимости, SDK targets (Min 33, Target 36), скрипт копирования APK ClaudeCage-1.3.apk
+**Назначение и роль в безопасности:** Конфигурация сборки Gradle: зависимости, SDK targets (Min 33, Target 36), скрипт копирования APK ClaudeCage-1.4.apk
 
 ```kotlin
 plugins {
@@ -5903,8 +6063,8 @@ android {
         applicationId = "com.example.claudecageand"
         minSdk = 33
         targetSdk = 36
-        versionCode = 4
-        versionName = "1.3"
+        versionCode = 5
+        versionName = "1.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -6057,7 +6217,7 @@ dependencies {
 ## 1. Общие Сведения о Проекте (Project Overview)
 
 - **Название приложения:** `ClaudeCage` (пакет: `com.example.claudecageand`).
-- **Текущая версия:** `1.3 (Build 4)` • **Hardening:** `Stage 10.2: Zero-Trust Hardening & Production Hotfix (JavaBridge Threading, Smart WakeLock, Fallback Cookie Purge)`.
+- **Текущая версия:** `1.4 (Build 5)` • **Hardening:** `Stage 11: Kernel Dead-Network Lock, Client Hints & Dynamic Island UI`.
 - **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36).
 - **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37).
 - **Целевой VPN-клиент:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray).
@@ -6081,9 +6241,10 @@ dependencies {
 3. **Белый список назначений и фильтр приватных IP (Destination Allowlist & Private IP Filter):**
    - Доступ через SOCKS5 шлюз разрешён исключительно к доменам из белого списка `ALLOWED_DOMAIN_SUFFIXES` (24 домена: `claude.ai`, `anthropic.com`, `claude.com`, `cloudflare.com`, `hcaptcha.com`, `stripe.com`, `stripe.network`, `intercom.io`, `intercomcdn.com`, `statsig.com`, `statsigapi.net`, `datadoghq.com`, `sentry.io`, `google.com`, `gstatic.com`, `googleapis.com`, `googleusercontent.com`, `youtube.com`, `apple.com`, `appleid.apple.com`, `browserleaks.com`, `browserleaks.net`, `browserleaks.org`, `ripe.net`). Все сторонние домены мгновенно отклоняются `0x05 (Connection Refused)`.
    - Прямые IPv4-подключения фильтруются через `isForbiddenIp`: запрещены loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), RFC 1918 приватные подсети (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) и IP самого tun-интерфейса.
-4. **Строгая привязка сокетов к VPN и поколенческий Kill-Switch (Generational Socket Binding):**
+4. **Строгая привязка сокетов к VPN, поколенческий Kill-Switch и Kernel Dead-Network Pinning:**
    - Состояние `VpnTunnelState.Connected` строго хранит non-null `network: Network` и монотонный счётчик `generation: Long`.
-   - При подключении VPN вызывается `connectivityManager.bindProcessToNetwork(network)` (и `bindProcessToNetwork(null)` при отключении).
+   - При подключении VPN вызывается `connectivityManager.bindProcessToNetwork(network)`.
+   - **Kernel Dead-Network Pinning (Stage 11):** При падении или отключении VPN вызов `bindProcessToNetwork(null)` категорически исключён. Процесс намеренно остаётся привязанным к дескриптору умершей сети туннеля (dead network handle). Ядро Linux на уровне системных вызовов сокетов немедленно пресекает любые попытки выхода пакетов наружу с кодом ошибки `ENETUNREACH`, делая физически невозможной утечку данных в сотовую сеть или Wi-Fi даже при сбоях Android Framework.
    - Исходящий TCP-сокет привязывается к сетевому стеку туннеля:
      1. `network.bindSocket(socket)` — с защитой от OS permission ошибок на One UI 9 / Samsung VPN Network.
      2. `socket.bind(InetSocketAddress(tunIpv4, 0))` — обязательная привязка локального IP источника к IPv4 адресу tun-адаптера с верификацией `outbound.localAddress == tunIpv4`.
@@ -6132,6 +6293,15 @@ dependencies {
     - Нативный шлюз `ClaudeCageNotificationBridge` фильтрует origin, выводит Heads-Up уведомления (`IMPORTANCE_HIGH`) с `BigTextStyle` и пробрасывает клики в чат (`window.__dispatchNotificationClick`).
     - **Smart `PARTIAL_WAKE_LOCK`:** в `MainActivity.onStop()` WakeLock захватывается исключительно при наличии свежего сетевого трафика через прокси за последние 15 секунд (`hasRecentTraffic(15_000L)` на базе отслеживания байтов в `pipe()`), что устраняет ложные срабатывания и разрядку батареи из-за неактивных keep-alive пулов Chromium.
     - **Комплексный сброс сессии (`purgeProfileSession`):** точечно очищает `ProfileStore`, кэш рендерера и аппаратный Keystore Fallback Cookie Jar (`deleteCookies(profile.id)`), а в статус-бар вынесена кнопка быстрой перезагрузки страницы `btnReload` (`🔄`).
+12. **Минималистичная ультратонкая панель и динамический морфинг якоря безопасности:**
+    - Верхняя панель переключается в тонкий режим (высота 26dp вместо 42dp, отступы 2dp), скрывая все избыточные кнопки и вторую строку статуса, оставляя чистый индикатор со статусом, кнопку перезагрузки `🔄`, переключатель размера `⤢`/`⤡` и сворачивания `▲`. Клик по тексту статуса открывает диалог диагностики.
+    - В свёрнутом режиме плавающий якорь безопасности морфится между тремя формами: `PILL` (капсула со статусом и аккаунтом), `SQUARE` (38x38dp скругленный квадрат со статусной точкой и первой буквой имени аккаунта), `CIRCLE` (34x34dp круг только со статусной точкой по центру).
+    - Морфинг управляется пальцами в реальном времени: мультитач 2 пальцами (pinch-in уменьшает форму Pill $\to$ Square $\to$ Circle; spread-out увеличивает форму Circle $\to$ Square $\to$ Pill) или двойной тап 1 пальцем (double-tap с дебаунсингом 260мс циклически переключает форму). Снаппинг к краям экрана учитывает габариты активной формы. Состояния сохраняются в SharedPreferences.
+13. **Эшелонированный лок ядра, Client Hints и Dynamic Island UI (Stage 11):**
+    - **Kernel Dead-Network Pinning:** в `VpnStateMonitor` запрещён вызов `bindProcessToNetwork(null)`. При обрыве VPN процесс удерживается на мёртвом дескрипторе сети туннеля, из-за чего ядро Linux отсекает 100% не-loopback пакетов с ошибкой `ENETUNREACH`.
+    - **Client Hints & Audio/WebGL Spoofer:** в `AntiFingerprintHardener` внедрён полифилл `navigator.userAgentData` (бренды Chromium, Google Chrome, платформа Android, модель `SM-S938B`, динамическая маскировка версии), инжекция микрошума в `AudioBuffer.prototype.getChannelData` (`1e-7 * NOISE_OFFSET`) и `WebGL(2)RenderingContext.prototype.readPixels` (`(pixels[i] + NOISE_OFFSET) % 256`).
+    - **Плавающий якорь с динамической границей и жестами:** цвет границы меняется в реальном времени (зелёный `#554ADE80`, жёлтый `#88FBBF24`, красный `#99F87171`), фон `#EB0D1117`. Устранён баг скачка в координаты `(0,0)` при смене формы (`prevX`/`prevY` + `TransitionManager`). Поддерживается горизонтальный флинг/свайп для переключения формы, дебаунсинг 170мс, клик по монограмме в режиме `SQUARE`.
+    - **2-Колоночная сетка быстрых действий:** кнопки верхней панели стилизованы под пилюли (`@drawable/bg_topbar_btn_pill`). В диалоге диагностики 11 вертикальных кнопок снизу заменены на компактную 2-колоночную сетку из 12 действий в самом верху диалога.
 
 ---
 
@@ -6317,16 +6487,16 @@ app/src/main/java/com/example/claudecageand/
 
 1. **Модульное тестирование (`./gradlew testDebugUnitTest`):**
    - **Результат:** `BUILD SUCCESSFUL`
-   - **Выполнено тестов:** 62/62 (0 сбоев, 100% тестов пройдены)
+   - **Выполнено тестов:** 64/64 (0 сбоев, 100% тестов пройдены)
    - Покрытие ключевых компонентов:
+     - `AntiFingerprintHardenerTest`: верификация полифилла `window.Notification`, геттера `permission`, `requestPermission`, `ServiceWorkerRegistration`, перехвата `navigator.permissions.query`, оффскрин-клонирования Canvas, cloaking метода `toString()`, блокировки TTS-голосов, фиксации локали `en-US`, флага `navigator.webdriver`, спуфинга `navigator.userAgentData` (Client Hints) и инжекции микрошума в `AudioBuffer` и `WebGL readPixels`.
      - `ClaudeCageNotificationBridgeTest`: верификация Zero-Trust allowlist для origin (`claude.ai`, `anthropic.com`), блокировка атак через поддомены (`claude.ai.attacker.com`), валидация каналов уведомлений.
-     - `AntiFingerprintHardenerTest`: верификация полифилла `window.Notification`, геттера `permission`, `requestPermission`, `ServiceWorkerRegistration`, перехвата `navigator.permissions.query`, оффскрин-клонирования Canvas, cloaking метода `toString()`, блокировки TTS-голосов, фиксации локали `en-US` и флага `navigator.webdriver`.
      - `TunnelDnsResolverTest`: верификация работы Scheduled watchdog, single-flight дедупликации, True SWR кэша и RFC 1035 TCP-фрейминга.
-     - `VpnGatekeeperProxyTest`: верификация белого списка доменов (24 домена), блокировки RFC 1918 подсетей и loopback, разрыва сокетов при потере VPN, блокировки IPv6 (0x08) и региональных TLD СНГ.
+     - `VpnGatekeeperProxyTest`: верификация расширенного белого списка доменов (24 домена), блокировки RFC 1918 подсетей и loopback, разрыва сокетов при потере VPN, блокировки IPv6 (0x08) и региональных TLD СНГ.
      - `UiStringsAndLanguageTest`, `AccountProfileManagerTest`, `SecurityAuditLoggerTest`, `AppIconManagerTest`, `VpnTunnelStateTest`.
 2. **Сборка Production APK (`./gradlew assembleDebug`):**
    - **Результат:** `BUILD SUCCESSFUL`
-   - **Собранный файл:** `ClaudeCage-1.3.apk` в корне проекта. Устаревшие бинарники автоматически удалены скриптом сборки.
+   - **Собранный файл:** `ClaudeCage-1.4.apk` в корне проекта. Устаревшие бинарники автоматически удалены скриптом сборки.
 
 ---
 

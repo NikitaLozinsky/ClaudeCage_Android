@@ -7,7 +7,7 @@
 ## 1. Общие Сведения о Проекте (Project Overview)
 
 - **Название приложения:** `ClaudeCage` (пакет: `com.example.claudecageand`).
-- **Текущая версия:** `1.3 (Build 4)` • **Hardening:** `Stage 10.3: Zero-Trust Hardening, W3C Notifications & Minimalist Dynamic Morphing Anchor`.
+- **Текущая версия:** `1.4 (Build 5)` • **Hardening:** `Stage 11: Kernel Dead-Network Lock, Client Hints & Dynamic Island UI`.
 - **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36).
 - **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37).
 - **Целевой VPN-клиент:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray).
@@ -31,9 +31,10 @@
 3. **Белый список назначений и фильтр приватных IP (Destination Allowlist & Private IP Filter):**
    - Доступ через SOCKS5 шлюз разрешён исключительно к доменам из белого списка `ALLOWED_DOMAIN_SUFFIXES` (24 домена: `claude.ai`, `anthropic.com`, `claude.com`, `cloudflare.com`, `hcaptcha.com`, `stripe.com`, `stripe.network`, `intercom.io`, `intercomcdn.com`, `statsig.com`, `statsigapi.net`, `datadoghq.com`, `sentry.io`, `google.com`, `gstatic.com`, `googleapis.com`, `googleusercontent.com`, `youtube.com`, `apple.com`, `appleid.apple.com`, `browserleaks.com`, `browserleaks.net`, `browserleaks.org`, `ripe.net`). Все сторонние домены мгновенно отклоняются `0x05 (Connection Refused)`.
    - Прямые IPv4-подключения фильтруются через `isForbiddenIp`: запрещены loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), RFC 1918 приватные подсети (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) и IP самого tun-интерфейса.
-4. **Строгая привязка сокетов к VPN и поколенческий Kill-Switch (Generational Socket Binding):**
+4. **Строгая привязка сокетов к VPN, поколенческий Kill-Switch и Kernel Dead-Network Pinning:**
    - Состояние `VpnTunnelState.Connected` строго хранит non-null `network: Network` и монотонный счётчик `generation: Long`.
-   - При подключении VPN вызывается `connectivityManager.bindProcessToNetwork(network)` (и `bindProcessToNetwork(null)` при отключении).
+   - При подключении VPN вызывается `connectivityManager.bindProcessToNetwork(network)`.
+   - **Kernel Dead-Network Pinning (Stage 11):** При падении или отключении VPN вызов `bindProcessToNetwork(null)` категорически исключён. Процесс намеренно остаётся привязанным к дескриптору умершей сети туннеля (dead network handle). Ядро Linux на уровне системных вызовов сокетов немедленно пресекает любые попытки выхода пакетов наружу с кодом ошибки `ENETUNREACH`, делая физически невозможной утечку данных в сотовую сеть или Wi-Fi даже при сбоях Android Framework.
    - Исходящий TCP-сокет привязывается к сетевому стеку туннеля:
      1. `network.bindSocket(socket)` — с защитой от OS permission ошибок на One UI 9 / Samsung VPN Network.
      2. `socket.bind(InetSocketAddress(tunIpv4, 0))` — обязательная привязка локального IP источника к IPv4 адресу tun-адаптера с верификацией `outbound.localAddress == tunIpv4`.
@@ -86,6 +87,11 @@
     - Верхняя панель переключается в тонкий режим (высота 26dp вместо 42dp, отступы 2dp), скрывая все избыточные кнопки и вторую строку статуса, оставляя чистый индикатор со статусом, кнопку перезагрузки `🔄`, переключатель размера `⤢`/`⤡` и сворачивания `▲`. Клик по тексту статуса открывает диалог диагностики.
     - В свёрнутом режиме плавающий якорь безопасности морфится между тремя формами: `PILL` (капсула со статусом и аккаунтом), `SQUARE` (38x38dp скругленный квадрат со статусной точкой и первой буквой имени аккаунта), `CIRCLE` (34x34dp круг только со статусной точкой по центру).
     - Морфинг управляется пальцами в реальном времени: мультитач 2 пальцами (pinch-in уменьшает форму Pill $\to$ Square $\to$ Circle; spread-out увеличивает форму Circle $\to$ Square $\to$ Pill) или двойной тап 1 пальцем (double-tap с дебаунсингом 260мс циклически переключает форму). Снаппинг к краям экрана учитывает габариты активной формы. Состояния сохраняются в SharedPreferences.
+13. **Эшелонированный лок ядра, Client Hints и Dynamic Island UI (Stage 11):**
+    - **Kernel Dead-Network Pinning:** в `VpnStateMonitor` запрещён вызов `bindProcessToNetwork(null)`. При обрыве VPN процесс удерживается на мёртвом дескрипторе сети туннеля, из-за чего ядро Linux отсекает 100% не-loopback пакетов с ошибкой `ENETUNREACH`.
+    - **Client Hints & Audio/WebGL Spoofer:** в `AntiFingerprintHardener` внедрён полифилл `navigator.userAgentData` (бренды Chromium, Google Chrome, платформа Android, модель `SM-S938B`, динамическая маскировка версии), инжекция микрошума в `AudioBuffer.prototype.getChannelData` (`1e-7 * NOISE_OFFSET`) и `WebGL(2)RenderingContext.prototype.readPixels` (`(pixels[i] + NOISE_OFFSET) % 256`).
+    - **Плавающий якорь с динамической границей и жестами:** цвет границы меняется в реальном времени (зелёный `#554ADE80`, жёлтый `#88FBBF24`, красный `#99F87171`), фон `#EB0D1117`. Устранён баг скачка в координаты `(0,0)` при смене формы (`prevX`/`prevY` + `TransitionManager`). Поддерживается горизонтальный флинг/свайп для переключения формы, дебаунсинг 170мс, клик по монограмме в режиме `SQUARE`.
+    - **2-Колоночная сетка быстрых действий:** кнопки верхней панели стилизованы под пилюли (`@drawable/bg_topbar_btn_pill`). В диалоге диагностики 11 вертикальных кнопок снизу заменены на компактную 2-колоночную сетку из 12 действий в самом верху диалога.
 
 ---
 

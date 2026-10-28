@@ -98,6 +98,37 @@ object AntiFingerprintHardener {
                     } catch (e) {}
                     return origToBlob.call(this, callback, type, quality);
                 }, 'toBlob');
+
+                // 7.1 AudioBuffer getChannelData Micro-Noise
+                if (window.AudioBuffer && AudioBuffer.prototype.getChannelData) {
+                    const origGetChannelData = AudioBuffer.prototype.getChannelData;
+                    AudioBuffer.prototype.getChannelData = cloak(function(channel) {
+                        const buffer = origGetChannelData.call(this, channel);
+                        if (buffer && buffer.length > 0) {
+                            buffer[0] = buffer[0] + (1e-7 * NOISE_OFFSET);
+                        }
+                        return buffer;
+                    }, 'getChannelData');
+                }
+
+                // 7.2 WebGL readPixels Micro-Noise
+                const hookWebGLReadPixels = (proto) => {
+                    if (!proto || !proto.readPixels) return;
+                    const origReadPixels = proto.readPixels;
+                    proto.readPixels = cloak(function(x, y, width, height, format, type, pixels) {
+                        origReadPixels.call(this, x, y, width, height, format, type, pixels);
+                        if (pixels && pixels.length > 0) {
+                            for (let i = 0; i < pixels.length; i += 4) {
+                                if (pixels[i + 3] > 0 || pixels.length < 4) {
+                                    pixels[i] = (pixels[i] + NOISE_OFFSET) % 256;
+                                    break;
+                                }
+                            }
+                        }
+                    }, 'readPixels');
+                };
+                if (window.WebGLRenderingContext) hookWebGLReadPixels(WebGLRenderingContext.prototype);
+                if (window.WebGL2RenderingContext) hookWebGLReadPixels(WebGL2RenderingContext.prototype);
             } catch (e) {}
         """.trimIndent()
 
@@ -361,6 +392,48 @@ object AntiFingerprintHardener {
                         navigator.connection.onchange = null;
                     }
                 }
+            } catch (e) {}
+
+            // 10.5 Spoof User-Agent Client Hints (navigator.userAgentData) to hide Android WebView brand
+            try {
+                const uaMatch = navigator.userAgent.match(/Chrome\/(\d+)(\.\d+\.\d+\.\d+)?/);
+                const majorVer = uaMatch ? uaMatch[1] : '155';
+                const fullVer = uaMatch && uaMatch[2] ? (uaMatch[1] + uaMatch[2]) : (majorVer + '.0.0.0');
+                const brandsList = Object.freeze([
+                    Object.freeze({ brand: 'Not_A Brand', version: '24' }),
+                    Object.freeze({ brand: 'Chromium', version: majorVer }),
+                    Object.freeze({ brand: 'Google Chrome', version: majorVer })
+                ]);
+                const fullVersionList = Object.freeze([
+                    Object.freeze({ brand: 'Not_A Brand', version: '24.0.0.0' }),
+                    Object.freeze({ brand: 'Chromium', version: fullVer }),
+                    Object.freeze({ brand: 'Google Chrome', version: fullVer })
+                ]);
+                const fakeUaData = Object.freeze({
+                    brands: brandsList,
+                    mobile: true,
+                    platform: 'Android',
+                    toJSON: cloak(function() {
+                        return { brands: this.brands, mobile: this.mobile, platform: this.platform };
+                    }, 'toJSON'),
+                    getHighEntropyValues: cloak(function(hints) {
+                        return Promise.resolve({
+                            brands: brandsList,
+                            mobile: true,
+                            platform: 'Android',
+                            platformVersion: '16.0.0',
+                            architecture: 'arm',
+                            bitness: '64',
+                            model: 'SM-S938B',
+                            uaFullVersion: fullVer,
+                            fullVersionList: fullVersionList
+                        });
+                    }, 'getHighEntropyValues')
+                });
+                Object.defineProperty(navigator, 'userAgentData', {
+                    get: cloak(() => fakeUaData, 'get userAgentData'),
+                    configurable: false
+                });
             } catch (e) {}
 
             // 11. W3C Web Notification API Polyfill & Native Bridge

@@ -60,10 +60,10 @@
             android:id="@+id/btnReturnToClaude"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:paddingHorizontal="8dp"
+            android:paddingHorizontal="9dp"
             android:paddingVertical="4dp"
-            android:layout_marginEnd="4dp"
-            android:background="#33FFFFFF"
+            android:layout_marginEnd="5dp"
+            android:background="@drawable/bg_topbar_btn_pill"
             android:textColor="@color/white"
             android:textSize="11sp"
             android:textStyle="bold"
@@ -75,10 +75,10 @@
             android:id="@+id/btnAccountSwitcher"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:paddingHorizontal="8dp"
+            android:paddingHorizontal="9dp"
             android:paddingVertical="4dp"
-            android:layout_marginEnd="4dp"
-            android:background="#1F2937"
+            android:layout_marginEnd="5dp"
+            android:background="@drawable/bg_topbar_btn_pill"
             android:textColor="#E2E8F0"
             android:textSize="11sp"
             android:textStyle="bold"
@@ -87,7 +87,7 @@
             android:maxWidth="110dp"
             android:text="👤 Account" />
 
-        <!-- Language toggle button (RU / EN) -->
+        <!-- Language toggle button (RU / EN) - in control center -->
         <TextView
             android:id="@+id/btnLangToggle"
             android:layout_width="wrap_content"
@@ -95,13 +95,14 @@
             android:paddingHorizontal="8dp"
             android:paddingVertical="4dp"
             android:layout_marginEnd="4dp"
-            android:background="#1F2937"
+            android:background="@drawable/bg_topbar_btn_pill"
             android:textColor="#E2E8F0"
             android:textSize="11sp"
             android:textStyle="bold"
-            android:text="RU" />
+            android:text="RU"
+            android:visibility="gone" />
 
-        <!-- Quick diagnostic button -->
+        <!-- Quick diagnostic button - in status text click -->
         <TextView
             android:id="@+id/btnDiagnostics"
             android:layout_width="wrap_content"
@@ -109,11 +110,12 @@
             android:paddingHorizontal="8dp"
             android:paddingVertical="4dp"
             android:layout_marginEnd="4dp"
-            android:background="#1F2937"
+            android:background="@drawable/bg_topbar_btn_pill"
             android:textColor="#E2E8F0"
             android:textSize="11sp"
             android:textStyle="bold"
-            android:text="@string/diag_button_label" />
+            android:text="@string/diag_button_label"
+            android:visibility="gone" />
 
         <!-- Reload WebView button -->
         <TextView
@@ -122,8 +124,8 @@
             android:layout_height="wrap_content"
             android:paddingHorizontal="8dp"
             android:paddingVertical="4dp"
-            android:layout_marginEnd="4dp"
-            android:background="#1F2937"
+            android:layout_marginEnd="5dp"
+            android:background="@drawable/bg_topbar_btn_pill"
             android:textColor="#E2E8F0"
             android:textSize="11sp"
             android:textStyle="bold"
@@ -134,10 +136,10 @@
             android:id="@+id/btnBarSizeToggle"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:paddingHorizontal="7dp"
+            android:paddingHorizontal="8dp"
             android:paddingVertical="4dp"
-            android:layout_marginEnd="4dp"
-            android:background="#1F2937"
+            android:layout_marginEnd="5dp"
+            android:background="@drawable/bg_topbar_btn_pill"
             android:textColor="#94A3B8"
             android:textSize="11sp"
             android:textStyle="bold"
@@ -148,9 +150,9 @@
             android:id="@+id/btnCollapseBar"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:paddingHorizontal="8dp"
+            android:paddingHorizontal="9dp"
             android:paddingVertical="4dp"
-            android:background="#1F2937"
+            android:background="@drawable/bg_topbar_btn_pill"
             android:textColor="#94A3B8"
             android:textSize="11sp"
             android:textStyle="bold"
@@ -204,6 +206,8 @@
                 android:textSize="11sp"
                 android:textStyle="bold"
                 android:visibility="gone"
+                android:clickable="true"
+                android:focusable="true"
                 android:text="🛡️" />
 
             <TextView

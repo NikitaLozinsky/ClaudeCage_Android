@@ -124,8 +124,13 @@ class VpnStateMonitor(
 
     /**
      * Publishes tunnel state synchronously under [stateLock], updating generation,
-     * binding or unbinding process network via [ConnectivityManager.bindProcessToNetwork],
+     * binding process network via [ConnectivityManager.bindProcessToNetwork] when Connected,
      * and immediately notifying all [TunnelListener]s.
+     *
+     * KERNEL DEAD-NETWORK PINNING (Stage 11):
+     * When VPN drops, NEVER unbind the process (never call bindProcessToNetwork(null))!
+     * Leaving the process bound to the disconnected Network handle causes the Linux
+     * kernel (netd) to reject all outbound non-loopback sockets with ENETUNREACH.
      */
     private fun publishState(next: VpnTunnelState) {
         synchronized(stateLock) {
@@ -148,7 +153,11 @@ class VpnStateMonitor(
                 }
                 _vpnState.value = VpnTunnelState.Disconnected
                 recordStateTelemetry(VpnTunnelState.Disconnected)
-                runCatching { connectivityManager.bindProcessToNetwork(null) }
+                // KERNEL DEAD-NETWORK PINNING (Stage 11):
+                // Deliberately do NOT call bindProcessToNetwork(null).
+                // Keeping the process pinned to the dead Network ensures the kernel refuses
+                // all outbound traffic with ENETUNREACH, preventing any cleartext leak
+                // to physical cellular / Wi-Fi interfaces.
                 for (listener in tunnelListeners) {
                     runCatching { listener.onTunnelChanged(prev, VpnTunnelState.Disconnected) }
                 }

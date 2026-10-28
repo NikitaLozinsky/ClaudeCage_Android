@@ -129,4 +129,30 @@ class AntiFingerprintHardenerTest {
         assertTrue("Must polyfill ServiceWorkerRegistration showNotification", js.contains("ServiceWorkerRegistration.prototype.showNotification = cloak("))
         assertTrue("Must intercept navigator.permissions.query", js.contains("navigator.permissions.query = cloak("))
     }
+
+    @Test
+    fun documentStartJs_audioAndWebGlNoiseInjected() {
+        val js = AntiFingerprintHardener.DOCUMENT_START_JS
+
+        // AudioBuffer noise
+        assertTrue("Must hook AudioBuffer.prototype.getChannelData", js.contains("AudioBuffer.prototype.getChannelData"))
+        assertTrue("Must inject micro-noise to AudioBuffer channel", js.contains("1e-7 * NOISE_OFFSET"))
+
+        // WebGL readPixels noise
+        assertTrue("Must hook WebGLRenderingContext readPixels", js.contains("hookWebGLReadPixels(WebGLRenderingContext.prototype)"))
+        assertTrue("Must hook WebGL2RenderingContext readPixels", js.contains("hookWebGLReadPixels(WebGL2RenderingContext.prototype)"))
+        assertTrue("Must inject micro-noise to readPixels", js.contains("(pixels[i] + NOISE_OFFSET) % 256"))
+    }
+
+    @Test
+    fun documentStartJs_clientHintsUserAgentDataSpoofed() {
+        val js = AntiFingerprintHardener.DOCUMENT_START_JS
+
+        assertTrue("Must define navigator.userAgentData", js.contains("userAgentData"))
+        assertTrue("Must provide getHighEntropyValues", js.contains("getHighEntropyValues"))
+        assertTrue("Must report Google Chrome brand", js.contains("Google Chrome"))
+        assertTrue("Must report Chromium brand", js.contains("Chromium"))
+        assertTrue("Must report Android platform", js.contains("Android"))
+        assertTrue("Must report target device model SM-S938B", js.contains("SM-S938B"))
+    }
 }
