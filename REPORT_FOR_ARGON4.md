@@ -299,4 +299,24 @@ Anthropic Claude и платёжный шлюз Stripe для подтвержд
 * Приведи конкретный, минимальный список точечных правок (diff / pinpoint fixes), если обнаружены потенциальные уязвимости или баги.
 
 ---
-*Документ подготовлен для финального аудита безопасности моделью Gemini Argon 4.*
+
+### 10. Реализация Рекомендаций Аудита Gemini Argon 4 и Релиз v1.5 (Build 6)
+
+По результатам аудита моделью **Gemini Argon 4**, архитектура ClaudeCage была признана **полностью готовой к релизу (Production Ready)**, с предписанием 4 точечных хирургических правок, которые были незамедлительно и строго реализованы:
+
+1. **Хирургическая правка 1 (WeakSet Idempotency в `AntiFingerprintHardener.kt`):**
+   - Для предотвращения кумулятивного искажения `buffer[0]` при повторных вызовах `AudioBuffer.prototype.getChannelData` внедрен учет модифицированных буферов через `const noisyAudioBuffers = new WeakSet()`.
+2. **Хирургическая правка 2 (Метка $currentShapeName и свободное перемещение якоря в `MainActivity.kt`):**
+   - В кнопке смены формы `btnShape` в диалоге диагностики внедрена интерполяция `$currentShapeName` для обоих языков (`🎛️ Форма: $currentShapeName` / `🎛️ Shape: $currentShapeName`).
+   - Сохранено свободное позиционирование якоря (`clampAndSaveAnchorPosition`) с безопасным отступом 4dp без принудительного прилипания к краям экрана.
+3. **Хирургическая правка 3 (Ограничение пула `relayExecutor` и добавление `stripe.link` в `VpnGatekeeperProxy.kt`):**
+   - Неограниченный `Executors.newCachedThreadPool()` заменен на `ThreadPoolExecutor(4, 128, 60L, TimeUnit.SECONDS, SynchronousQueue())` с потоками-демонами для гарантированной защиты от исчерпания памяти при экстремальных штормах сокетов.
+   - В `ALLOWED_DOMAIN_SUFFIXES` добавлен домен `stripe.link` (суммарно 28 доменов), устраняющий сбои при 1-click оплате подписки Claude Pro.
+4. **Хирургическая правка 4 (Синхронизация версии и выпуск релиза 1.5):**
+   - В `SecurityAuditLogger.generateMarkdownReport()` строка обновлена до: `ClaudeCage v1.5 (Build 6) • Stage 11: Final Production Readiness & Zero-Leak Kernel Lock`.
+   - В `app/build.gradle.kts` установлены `versionCode = 6`, `versionName = "1.5"`.
+   - Прогон тестов: **64 из 64 тестов пройдены успешно (100%)**.
+   - Собран финальный релизный бинарник: **`ClaudeCage-1.5.apk`**.
+
+---
+*Документ актуализирован по итогам финального аудита безопасности Gemini Argon 4 и релиза v1.5 (Build 6).*

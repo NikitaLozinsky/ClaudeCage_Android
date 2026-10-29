@@ -99,12 +99,14 @@ object AntiFingerprintHardener {
                     return origToBlob.call(this, callback, type, quality);
                 }, 'toBlob');
 
-                // 7.1 AudioBuffer getChannelData Micro-Noise
+                // 7.1 AudioBuffer getChannelData Idempotent Micro-Noise
                 if (window.AudioBuffer && AudioBuffer.prototype.getChannelData) {
+                    const noisyAudioBuffers = new WeakSet();
                     const origGetChannelData = AudioBuffer.prototype.getChannelData;
                     AudioBuffer.prototype.getChannelData = cloak(function(channel) {
                         const buffer = origGetChannelData.call(this, channel);
-                        if (buffer && buffer.length > 0) {
+                        if (buffer && buffer.length > 0 && !noisyAudioBuffers.has(buffer)) {
+                            noisyAudioBuffers.add(buffer);
                             buffer[0] = buffer[0] + (1e-7 * NOISE_OFFSET);
                         }
                         return buffer;

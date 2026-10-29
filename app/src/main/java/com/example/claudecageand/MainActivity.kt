@@ -1737,7 +1737,9 @@ class MainActivity : AppCompatActivity() {
             FloatingAnchorShape.SQUARE -> UiStrings.shapeSquare(lang)
             FloatingAnchorShape.CIRCLE -> UiStrings.shapeCircle(lang)
         }
-        val btnShape = createGridButton(if (lang == UiLanguage.RU) "🎛️ Форма: " else "🎛️ Shape: ") {
+        val btnShape = createGridButton(
+            if (lang == UiLanguage.RU) "🎛️ Форма: $currentShapeName" else "🎛️ Shape: $currentShapeName"
+        ) {
             cycleAnchorShape()
             dialogRef?.dismiss()
             showDiagnosticsDialog()
@@ -2096,7 +2098,7 @@ class MainActivity : AppCompatActivity() {
         return ComponentVersions(
             appVersionName = verName,
             appVersionCode = verCode,
-            stageHardening = "Stage 11: Kernel Dead-Network Lock, Client Hints & Dynamic Island UI",
+            stageHardening = "Stage 11: Final Production Readiness & Zero-Leak Kernel Lock",
             androidRelease = Build.VERSION.RELEASE,
             apiLevel = Build.VERSION.SDK_INT,
             securityPatch = patch,

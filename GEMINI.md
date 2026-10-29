@@ -7,7 +7,7 @@
 ## 1. Общие Сведения о Проекте (Project Overview)
 
 - **Название приложения:** `ClaudeCage` (пакет: `com.example.claudecageand`).
-- **Текущая версия:** `1.4 (Build 5)` • **Hardening:** `Stage 11: Kernel Dead-Network Lock, Client Hints & Dynamic Island UI`.
+- **Текущая версия:** `1.5 (Build 6)` • **Hardening:** `Stage 11: Final Production Readiness & Zero-Leak Kernel Lock`.
 - **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36).
 - **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37).
 - **Целевой VPN-клиент:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray).
@@ -29,7 +29,7 @@
    - Применяется `.removeImplicitRules()` в `ProxyConfig.Builder()`, предотвращающий автоматический обход прокси Chromium для `localhost` и `127.0.0.1`.
    - Google Safe Browsing отключён через `WebSettingsCompat.setSafeBrowsingEnabled(settings, false)`, исключая сторонние внепрокси-запросы Chromium к серверам Google.
 3. **Белый список назначений и фильтр приватных IP (Destination Allowlist & Private IP Filter):**
-   - Доступ через SOCKS5 шлюз разрешён исключительно к доменам из белого списка `ALLOWED_DOMAIN_SUFFIXES` (27 доменов: `claude.ai`, `anthropic.com`, `claude.com`, `cloudflare.com`, `hcaptcha.com`, `stripe.com`, `stripe.network`, `stripecdn.com`, `withpersona.com`, `persona.com`, `intercom.io`, `intercomcdn.com`, `statsig.com`, `statsigapi.net`, `datadoghq.com`, `sentry.io`, `google.com`, `gstatic.com`, `googleapis.com`, `googleusercontent.com`, `youtube.com`, `apple.com`, `appleid.apple.com`, `browserleaks.com`, `browserleaks.net`, `browserleaks.org`, `ripe.net`). Все сторонние домены мгновенно отклоняются `0x05 (Connection Refused)`.
+   - Доступ через SOCKS5 шлюз разрешён исключительно к доменам из белого списка `ALLOWED_DOMAIN_SUFFIXES` (28 доменов: `claude.ai`, `anthropic.com`, `claude.com`, `cloudflare.com`, `hcaptcha.com`, `stripe.com`, `stripe.network`, `stripecdn.com`, `stripe.link`, `withpersona.com`, `persona.com`, `intercom.io`, `intercomcdn.com`, `statsig.com`, `statsigapi.net`, `datadoghq.com`, `sentry.io`, `google.com`, `gstatic.com`, `googleapis.com`, `googleusercontent.com`, `youtube.com`, `apple.com`, `appleid.apple.com`, `browserleaks.com`, `browserleaks.net`, `browserleaks.org`, `ripe.net`). Все сторонние домены мгновенно отклоняются `0x05 (Connection Refused)`.
    - Прямые IPv4-подключения фильтруются через `isForbiddenIp`: запрещены loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), RFC 1918 приватные подсети (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) и IP самого tun-интерфейса.
 4. **Строгая привязка сокетов к VPN, поколенческий Kill-Switch и Kernel Dead-Network Pinning:**
    - Состояние `VpnTunnelState.Connected` строго хранит non-null `network: Network` и монотонный счётчик `generation: Long`.
@@ -42,9 +42,9 @@
    - Синхронный слушатель `TunnelListener` вызывается под блокировкой `stateLock` при любом изменении VPN:
      - При падении VPN мгновенно закрывает дескрипторы всех активных клиентских и серверных сокетов и вызывает `dnsResolver.clearCache(clearStale = false)`, сохраняя stale-кэш для быстрого Doze wake-up.
      - При VPN handover (смене tun/NetID) мгновенно закрывает сокеты устаревших поколений (`gen < currentGeneration`).
-5. **Выделенный пул потоков для передачи трафика (Relay Anti-Starvation):**
-   - Двунаправленный пайпинг данных (`relayTraffic`) работает на выделенном пуле потоков `relayExecutor = Executors.newCachedThreadPool { ... }.asCoroutineDispatcher()`.
-   - Лимит пула `Dispatchers.IO` (64 потока) больше не расходуется на блокирующий ввод-вывод сокетов, что гарантирует мгновенное выполнение корутин таймеров, телеметрии и мониторинга.
+5. **Выделенный пул потоков для передачи трафика (Relay Anti-Starvation & Bounded Pool):**
+   - Двунаправленный пайпинг данных (`relayTraffic`) работает на выделенном пуле потоков `relayExecutor = ThreadPoolExecutor(4, 128, 60L, TimeUnit.SECONDS, SynchronousQueue()) { ... }.asCoroutineDispatcher()`.
+   - Лимит пула `Dispatchers.IO` (64 потока) больше не расходуется на блокирующий ввод-вывод сокетов, а ограничение пула релея в 128 потоков предотвращает OOM при экстремальных параллельных всплесках сокетов.
    - Реализовано полудуплексное закрытие TCP (`shutdownOutput()` / `shutdownInput()`).
 6. **Fail-Closed TCP DNS с выделенным Scheduled Watchdog, True SWR и Single-Flight:**
    - Системный DNS Android и сторонние Smart DNS полностью игнорируются.
@@ -143,7 +143,7 @@ app/src/main/java/com/example/claudecageand/
     - Локальный резолвинг через `TunnelDnsResolver.resolve(domain)`.
   - `ATYP_IPV6 (0x04)`: немедленный отказ `0x08 (Address type not supported)`.
 - **Выделенный пул ретрансляции (`relayExecutor`):**
-  - Двунаправленный обмен сокетов обслуживается `Executors.newCachedThreadPool()`, предотвращая голодание `Dispatchers.IO` (лимит 64 потока) при параллельных запросах.
+  - Двунаправленный обмен сокетов обслуживается ограниченным `ThreadPoolExecutor(4, 128, 60L, TimeUnit.SECONDS, SynchronousQueue())`, предотвращая голодание `Dispatchers.IO` (лимит 64 потока) при параллельных запросах и защищая от OOM при экстремальных штормах сокетов.
   - Симметричный half-duplex shutdown (`shutdownOutput()` / `shutdownInput()`) при завершении одного из направлений.
 - **Поколенческий сокет-трекинг:** `outboundSockets: ConcurrentHashMap<Socket, Long>` регистрирует исходящие сокеты с номером поколения туннеля. При разрыве VPN или смене туннеля (handover) синхронный коллбэк `TunnelListener` закрывает дескрипторы устаревших сокетов.
 

@@ -30,6 +30,9 @@ import java.nio.ByteOrder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -68,8 +71,15 @@ class VpnGatekeeperProxy(
     private val proxyJob = SupervisorJob()
     private val proxyScope = CoroutineScope(Dispatchers.IO + proxyJob)
 
-    // Dedicated cached thread pool for relay traffic so blocking read() never starves Dispatchers.IO
-    private val relayExecutor = Executors.newCachedThreadPool { runnable ->
+    // Dedicated bounded thread pool for relay traffic (max 128 threads) so blocking read() never starves Dispatchers.IO
+    // or causes OOM under extreme socket storms
+    private val relayExecutor = ThreadPoolExecutor(
+        4,
+        128,
+        60L,
+        TimeUnit.SECONDS,
+        SynchronousQueue()
+    ) { runnable ->
         Thread(runnable, "VpnProxyRelay").apply { isDaemon = true }
     }
     private val relayDispatcher = relayExecutor.asCoroutineDispatcher()
@@ -631,6 +641,7 @@ class VpnGatekeeperProxy(
             "stripe.com",
             "stripe.network",
             "stripecdn.com",
+            "stripe.link",
             "withpersona.com",
             "persona.com",
             "intercom.io",

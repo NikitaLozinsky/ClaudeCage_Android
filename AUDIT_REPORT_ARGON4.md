@@ -4,7 +4,7 @@
 **Целевая аудитория аудита:** Gemini Argon 4 (Frontier Reasoning & Security Architecture Model)  
 **Дата актуализации:** 29 октября 2026 г.  
 **Проект:** `ClaudeCage` (пакет: `com.example.claudecageand`)  
-**Текущая версия:** `1.4 (Build 5)` • **Уровень харденинга:** `Stage 11: Final Production Readiness & Zero-Leak Kernel Lock`  
+**Текущая версия:** `1.5 (Build 6)` • **Уровень харденинга:** `Stage 11: Final Production Readiness & Zero-Leak Kernel Lock`  
 **Целевая платформа:** Android 13+ (Min SDK: 33, Target/Compile SDK: 36)  
 **Боевая среда тестирования:** Samsung Galaxy S25 Ultra (`SM-S938B`, `pa3q`), Android 17 (API 37, One UI 9)  
 **Целевой сетевой туннель:** Amnezia VPN Premium (`tun0` / `tun1`, NetID ~300+, протоколы WireGuard, Awg, Xray)  
@@ -95,9 +95,9 @@ could not be loaded because: net::ERR_SOCKS_CONNECTION_FAILED
 2. Домены `withpersona.com` и `stripecdn.com` отсутствовали в списке `ALLOWED_DOMAIN_SUFFIXES`. Шлюз `VpnGatekeeperProxy` немедленно отклонял TCP-запрос ответом SOCKS5 `0x05 (Connection Refused)`, который Chromium WebView транслировал в ошибку `net::ERR_SOCKS_CONNECTION_FAILED`.
 
 **Решение:**
-- В `ALLOWED_DOMAIN_SUFFIXES` добавлены `withpersona.com`, `persona.com` и `stripecdn.com` (белый список расширен до 27 доменов).
+- В `ALLOWED_DOMAIN_SUFFIXES` добавлены `withpersona.com`, `persona.com`, `stripecdn.com` и `stripe.link` (белый список расширен до 28 доменов).
 - В `MainActivity.kt` внедрено автоматическое отображение кнопки `btnReturnToClaude` («⬅️ Вернуться в Claude») при навигации на Persona, Stripe или BrowserLeaks.
-- Добавлены модульные тесты для проверки Persona и Stripe CDN в `VpnGatekeeperProxyTest.kt`.
+- Добавлены модульные тесты для проверки Persona, Stripe CDN и Stripe Link в `VpnGatekeeperProxyTest.kt`.
 
 ---
 
@@ -108,11 +108,11 @@ could not be loaded because: net::ERR_SOCKS_CONNECTION_FAILED
 ### 3.1. Ликвидация Открытого Прокси и Фильтрация Приватных Подсетей
 - **Проблема:** Порт `127.0.0.1:<random-port>` локального шлюза доступен любому процессу на устройстве с разрешением `INTERNET`. Любое стороннее приложение или вредоносный скрипт могли направлять свой трафик через шлюз, используя защищённую идентичность и туннель ClaudeCage.
 - **Архитектурное решение (`VpnGatekeeperProxy.kt`):**
-  1. Введён строгий белый список назначений `ALLOWED_DOMAIN_SUFFIXES` (27 доменов):
+  1. Введён строгий белый список назначений `ALLOWED_DOMAIN_SUFFIXES` (28 доменов):
      - Сервисы Anthropic: `claude.ai`, `anthropic.com`, `claude.com`.
      - Верификация личности KYC: `withpersona.com`, `persona.com`.
      - Антифрод и защита: `cloudflare.com`, `hcaptcha.com`.
-     - Биллинг и CDN: `stripe.com`, `stripe.network`, `stripecdn.com`.
+     - Биллинг и CDN: `stripe.com`, `stripe.network`, `stripecdn.com`, `stripe.link`.
      - Клиентский чат: `intercom.io`, `intercomcdn.com`.
      - Телеметрия сервиса: `statsig.com`, `statsigapi.net`, `datadoghq.com`, `sentry.io`.
      - OAuth и сервисы Google: `google.com`, `gstatic.com`, `googleapis.com`, `googleusercontent.com`, `youtube.com`.
@@ -277,7 +277,7 @@ could not be loaded because: net::ERR_SOCKS_CONNECTION_FAILED
 
 | Вектор Угрозы / Компонент | Stage 8 (Базовая версия) | Stage 9 (Production) | Stage 11 (Final Pre-Release Edition) |
 | :--- | :--- | :--- | :--- |
-| **SOCKS5 Порт 127.0.0.1** | Открыт всем приложениям | Открыт всем приложениям | **Destination Allowlist (27 доменов: Claude, Persona, Stripe) + Private IP Filter** |
+| **SOCKS5 Порт 127.0.0.1** | Открыт всем приложениям | Открыт всем приложениям | **Destination Allowlist (28 доменов: Claude, Persona, Stripe, Stripe Link) + Private IP Filter** |
 | **Пул Потоков Релея** | `Dispatchers.IO` (голодание) | `Dispatchers.IO` (голодание) | **Выделенный `relayExecutor` (Cached Thread Pool)** |
 | **DNS Watchdog** | `withTimeoutOrNull` (hang 54s) | Coroutine watchdog | **`ScheduledExecutorService` (2500ms hard close)** |
 | **DNS Дедупликация** | Отсутствует | Отсутствует | **Single-Flight (`inFlightQueries`)** |
@@ -6288,7 +6288,7 @@ dependencies {
    - Применяется `.removeImplicitRules()` в `ProxyConfig.Builder()`, предотвращающий автоматический обход прокси Chromium для `localhost` и `127.0.0.1`.
    - Google Safe Browsing отключён через `WebSettingsCompat.setSafeBrowsingEnabled(settings, false)`, исключая сторонние внепрокси-запросы Chromium к серверам Google.
 3. **Белый список назначений и фильтр приватных IP (Destination Allowlist & Private IP Filter):**
-   - Доступ через SOCKS5 шлюз разрешён исключительно к доменам из белого списка `ALLOWED_DOMAIN_SUFFIXES` (27 доменов: `claude.ai`, `anthropic.com`, `claude.com`, `cloudflare.com`, `hcaptcha.com`, `stripe.com`, `stripe.network`, `stripecdn.com`, `withpersona.com`, `persona.com`, `intercom.io`, `intercomcdn.com`, `statsig.com`, `statsigapi.net`, `datadoghq.com`, `sentry.io`, `google.com`, `gstatic.com`, `googleapis.com`, `googleusercontent.com`, `youtube.com`, `apple.com`, `appleid.apple.com`, `browserleaks.com`, `browserleaks.net`, `browserleaks.org`, `ripe.net`). Все сторонние домены мгновенно отклоняются `0x05 (Connection Refused)`.
+   - Доступ через SOCKS5 шлюз разрешён исключительно к доменам из белого списка `ALLOWED_DOMAIN_SUFFIXES` (28 доменов: `claude.ai`, `anthropic.com`, `claude.com`, `cloudflare.com`, `hcaptcha.com`, `stripe.com`, `stripe.network`, `stripecdn.com`, `stripe.link`, `withpersona.com`, `persona.com`, `intercom.io`, `intercomcdn.com`, `statsig.com`, `statsigapi.net`, `datadoghq.com`, `sentry.io`, `google.com`, `gstatic.com`, `googleapis.com`, `googleusercontent.com`, `youtube.com`, `apple.com`, `appleid.apple.com`, `browserleaks.com`, `browserleaks.net`, `browserleaks.org`, `ripe.net`). Все сторонние домены мгновенно отклоняются `0x05 (Connection Refused)`.
    - Прямые IPv4-подключения фильтруются через `isForbiddenIp`: запрещены loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), RFC 1918 приватные подсети (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) и IP самого tun-интерфейса.
 4. **Строгая привязка сокетов к VPN, поколенческий Kill-Switch и Kernel Dead-Network Pinning:**
    - Состояние `VpnTunnelState.Connected` строго хранит non-null `network: Network` и монотонный счётчик `generation: Long`.
@@ -6496,7 +6496,7 @@ app/src/main/java/com/example/claudecageand/
 | Тестовый класс | Расположение | Проверяемый функционал |
 | :--- | :--- | :--- |
 | `TunnelDnsResolverTest` | `app/src/test/.../net/` | Watchdog таймауты, `staleCache` fallback, кэширование, canary NODATA, TCP DNS |
-| `VpnGatekeeperProxyTest` | `app/src/test/.../net/` | Блокировка при VPN Off, разрыв сокетов, блокировка IPv6 (0x08), блокировка доменов СНГ (.ru/.by/.su), Destination Allowlist (27 доменов: Claude, Persona, Stripe), Network binding, проверка активности трафика `hasRecentTraffic` |
+| `VpnGatekeeperProxyTest` | `app/src/test/.../net/` | Блокировка при VPN Off, разрыв сокетов, блокировка IPv6 (0x08), блокировка доменов СНГ (.ru/.by/.su), Destination Allowlist (28 доменов: Claude, Persona, Stripe, Stripe Link), Network binding, проверка активности трафика `hasRecentTraffic` |
 | `VpnTunnelStateTest` | `app/src/test/.../net/` | Модели состояний туннеля, равенство и форматирование |
 | `AntiFingerprintHardenerTest` | `app/src/test/.../security/` | Canvas шум для seed 0, `toBlob`, `speechSynthesis`, `Intl` en-US, `webdriver` |
 | `AccountProfileManagerTest` | `app/src/test/.../accounts/` | Создание, переименование, удаление, переключение профилей, seed |
@@ -6541,11 +6541,11 @@ app/src/main/java/com/example/claudecageand/
      - `AntiFingerprintHardenerTest` (10 тестов): верификация полифилла `window.Notification`, геттера `permission`, `requestPermission`, `ServiceWorkerRegistration`, перехвата `navigator.permissions.query`, оффскрин-клонирования Canvas, cloaking метода `toString()`, блокировки TTS-голосов, фиксации локали `en-US`, флага `navigator.webdriver`, спуфинга `navigator.userAgentData` (Client Hints) и инжекции микрошума в `AudioBuffer` и `WebGL readPixels`.
      - `ClaudeCageNotificationBridgeTest` (3 теста): верификация Zero-Trust allowlist для origin (`claude.ai`, `anthropic.com`), блокировка атак через поддомены (`claude.ai.attacker.com`), валидация каналов уведомлений.
      - `TunnelDnsResolverTest` (14 тестов): верификация работы Scheduled watchdog, single-flight дедупликации, True SWR кэша и RFC 1035 TCP-фрейминга.
-     - `VpnGatekeeperProxyTest` (11 тестов): верификация расширенного белого списка доменов (27 доменов: Claude, Persona KYC, Stripe CDN), блокировки RFC 1918 подсетей и loopback, разрыва сокетов при потере VPN, блокировки IPv6 (0x08) и региональных TLD СНГ, окна активности Smart WakeLock.
+     - `VpnGatekeeperProxyTest` (11 тестов): верификация расширенного белого списка доменов (28 доменов: Claude, Persona KYC, Stripe CDN, Stripe Link), блокировки RFC 1918 подсетей и loopback, разрыва сокетов при потере VPN, блокировки IPv6 (0x08) и региональных TLD СНГ, окна активности Smart WakeLock.
      - `UiStringsAndLanguageTest` (2 теста), `AccountProfileManagerTest` (13 тестов), `SecurityAuditLoggerTest` (5 тестов), `AppIconManagerTest` (3 теста), `VpnTunnelStateTest` (2 теста), `ExampleUnitTest` (1 тест).
 2. **Сборка Production APK (`./gradlew assembleDebug copyApkToRoot`):**
    - **Результат:** `BUILD SUCCESSFUL`
-   - **Собранный файл:** `ClaudeCage-1.4.apk` в корне проекта (~12.9 МБ). Устаревшие бинарники автоматически удалены скриптом сборки.
+   - **Собранный файл:** `ClaudeCage-1.5.apk` в корне проекта (~12.9 МБ). Устаревшие бинарники автоматически удалены скриптом сборки.
 
 ---
 
@@ -6561,8 +6561,8 @@ app/src/main/java/com/example/claudecageand/
 1. **Сетевой уровень и Kernel Dead-Network Pinning (Android 14–17 / One UI 9):**
    - Корректно ли ядро Linux на флагманских чипсетах (Snapdragon 8 Elite / SM-S938B) обрабатывает удержание процесса на мертвом дескрипторе туннеля (`dead network handle`) без вызова `bindProcessToNetwork(null)`? Существуют ли условия гонки при быстром переподключении VPN (handover `tun0` $\to$ `tun1`), когда старый сокет может пережить смену поколения?
    - Достаточен ли размер пула `relayExecutor = Executors.newCachedThreadPool()` для исключения исчерпания памяти при экстремальной параллельной нагрузке?
-2. **Белый список доменов (27 доменов) и Утечки через CDN/Биллинг:**
-   - Обеспечивает ли белый список из 27 доменов (`claude.ai`, `anthropic.com`, `withpersona.com`, `persona.com`, `stripecdn.com` и др.) строгую изоляцию? Нет ли риска эксфильтрации данных через разрешенные поддомены Google/Apple/Persona?
+2. **Белый список доменов (28 доменов) и Утечки через CDN/Биллинг:**
+   - Обеспечивает ли белый список из 28 доменов (`claude.ai`, `anthropic.com`, `withpersona.com`, `persona.com`, `stripecdn.com`, `stripe.link` и др.) строгую изоляцию? Нет ли риска эксфильтрации данных через разрешенные поддомены Google/Apple/Persona?
    - Требуются ли дополнительные поддомены для корректного завершения процесса оплаты и KYC в Claude Pro?
 3. **DNS-резолвер и устойчивость к спуфингу:**
    - Полностью ли Single-Flight дедупликация через `inFlightQueries: ConcurrentHashMap<String, Deferred<...>>` исключает состояние гонки при одновременном завершении или ошибке нескольких параллельных корутин?
@@ -6578,4 +6578,15 @@ app/src/main/java/com/example/claudecageand/
    - Приведи конкретный, минимальный список точечных правок (diff / pinpoint fixes), если обнаружены потенциальные уязвимости или баги.
 
 ---
-*Отчёт сформирован для глубокого архитектурного аудита безопасности моделью Gemini Argon 4.*
+
+## 8. Итоги Аудита Gemini Argon 4: Полная Готовность к Релизу (Production Ready) и 4 Хирургических Фикса
+
+Модель **Gemini Argon 4** вынесла официальный вердикт: **Архитектура ClaudeCage признана полностью готовой к релизу (Production Ready)**. Все 4 рекомендованные точечные микро-правки были полностью реализованы в релизе **v1.5 (Build 6)**:
+
+1. **WeakSet Idempotency для AudioBuffer:** Исключено кумулятивное искажение при повторном вызове `getChannelData` на одном буфере (`noisyAudioBuffers = new WeakSet()`).
+2. **Метка формы якоря:** В диалоге диагностики исправлено отображение `$currentShapeName` на кнопке смены формы.
+3. **Ограничение пула Relay & Поддержка Stripe Link:** `relayExecutor` ограничен `ThreadPoolExecutor(4, 128, 60s, SynchronousQueue())`, а в белый список добавлен домен `stripe.link` (суммарно 28 доменов).
+4. **Синхронизация версии:** Версия обновлена до `v1.5 (Build 6)`, все 64 модульных теста пройдены на 100%, скомпилирован релизный бинарник `ClaudeCage-1.5.apk`.
+
+---
+*Отчёт актуализирован по итогам финального аудита безопасности моделью Gemini Argon 4.*

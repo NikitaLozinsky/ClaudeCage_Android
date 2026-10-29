@@ -137,6 +137,7 @@ class AntiFingerprintHardenerTest {
         // AudioBuffer noise
         assertTrue("Must hook AudioBuffer.prototype.getChannelData", js.contains("AudioBuffer.prototype.getChannelData"))
         assertTrue("Must inject micro-noise to AudioBuffer channel", js.contains("1e-7 * NOISE_OFFSET"))
+        assertTrue("Must track noisy buffers in WeakSet for idempotency", js.contains("noisyAudioBuffers = new WeakSet()"))
 
         // WebGL readPixels noise
         assertTrue("Must hook WebGLRenderingContext readPixels", js.contains("hookWebGLReadPixels(WebGLRenderingContext.prototype)"))
